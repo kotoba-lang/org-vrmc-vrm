@@ -87,7 +87,7 @@
   (let [doc (vrm/parse-vrm (make-test-vrm))
         parts (vrm/decompose doc)
         sources (mapv (fn [p] {:part p :doc doc}) parts)
-        composed (vrm/compose sources {:skeleton-base 0})
+        composed (vrm/compose-parts sources {:skeleton-base 0})
         output (vrm/export-glb composed)
         chunks (glb/parse-glb output)]
     (is (seq (:json chunks)))

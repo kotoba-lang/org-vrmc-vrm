@@ -51,10 +51,31 @@
             [vrm.firstperson :as firstperson]))
 
 ;; ── Re-exports for convenience (mirrors the original `pub use` set) ──
-
+;;
+;; `compose-parts` (not `compose`, /loop maturity pass bug fix): a def named
+;; `compose` in this namespace collides with the required `vrm.compose`
+;; namespace itself under ClojureScript `:simple`/`:whitespace` optimization
+;; (Google Closure does not rename/munge namespace-qualified JS paths at
+;; those levels the way `:advanced` does, so `vrm.compose` — the sub-
+;; namespace's own compiled JS object, nested under `vrm` — and `vrm/compose`
+;; — this def, also compiling to the `compose` property on the `vrm` JS
+;; object — fight over the exact same property). The compiler surfaces this
+;; itself: `WARNING: Namespace vrm.compose clashes with var vrm/compose`.
+;; At runtime the def's assignment (a plain function) clobbers the whole
+;; `vrm.compose` namespace object, so any code that later reaches into
+;; `vrm.compose.<anything else>` (e.g. `vrm.compose/decompose` — no,
+;; decompose lives in `vrm.part` — but any other member of `vrm.compose`
+;; itself, or Closure's own module-init bookkeeping expecting a namespace
+;; object there) crashes with something like "Cannot set/read properties of
+;; undefined." A `kami-app-character-creator` build hit exactly this
+;; (requiring `vrm.parse` directly instead of root `vrm` was that app's own
+;; workaround). No other re-export here collides this way (`parse-vrm`/
+;; `decompose`/`export-glb` are all named differently from their source
+;; namespace's last segment — `vrm.parse`/`vrm.part`/`vrm.export` — so only
+;; `compose` had this exact name-for-name collision).
 (def parse-vrm parse/parse-vrm)
 (def decompose part/decompose)
-(def compose compose/compose)
+(def compose-parts compose/compose)
 (def export-glb export/export-glb)
 
 (def new-expression-manager expression/new-manager)

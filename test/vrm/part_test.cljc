@@ -27,3 +27,24 @@
 ;; mirrors `classify_other`
 (deftest classify-other
   (is (= :other (part/classify-mesh "Unknown_Part" [] ""))))
+
+;; ── mesh-name-priority coverage (/loop maturity pass, ADR-2607031200) ──────
+;; Real bug fix: found by classifying a real production VRM's meshes (not
+;; committed; the "wear"/"robo_face" case below reproduces the exact
+;; collision synthetically). classify-mesh used to check the combined
+;; mesh+node+material blob first, so a mesh literally named "wear"
+;; (clothing) with an attached material coincidentally named "robo_face"
+;; (a visor texture, not a facial feature) matched the :face keyword "face"
+;; as a substring of "robo_face" and mis-classified as :face. Now the mesh's
+;; own name is checked first (VRoid Studio's strongest, most direct naming
+;; signal); material/node names are only a fallback for generically-named
+;; meshes.
+
+(deftest classify-head-mesh-name-is-face
+  (is (= :face (part/classify-mesh "head" [] ""))))
+
+(deftest classify-wear-mesh-name-wins-over-coincidental-face-material
+  (is (= :outfit (part/classify-mesh "wear" ["robo_face" "backpack_metal"] ""))))
+
+(deftest classify-falls-back-to-material-names-when-mesh-name-is-generic
+  (is (= :hair (part/classify-mesh "mesh001" ["hair_material"] ""))))

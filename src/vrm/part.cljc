@@ -6,23 +6,47 @@
 ;; Category tag for avatar parts.
 (def part-categories #{:body :hair :face :outfit :accessory :other})
 
+;; Category -> keyword set, checked in this priority order (hair before
+;; face: a "hair_tail" mesh with no face-ish material must not fall through
+;; to a later, broader bucket; face before body/outfit: a "head" mesh's own
+;; materials are legitimately named things like "eye"/"brow").
+(def ^:private category-keywords
+  [[:hair ["hair" "bangs"]]
+   [:face ["face" "head" "eye" "mouth" "brow"]]
+   [:body ["body" "skin"]]
+   [:outfit ["cloth" "outfit" "wear" "shirt" "pants" "dress" "shoe" "tops" "bottoms"]]
+   [:accessory ["accessory" "hat" "glass" "ribbon" "earring" "necklace"]]])
+
+(defn- match-category [s category-keywords]
+  (some (fn [[category kws]] (when (some #(clojure.string/includes? s %) kws) category))
+        category-keywords))
+
 (defn classify-mesh
   "Classify a mesh node into a category keyword by name heuristics (VRoid
   Studio naming: \"Body\", \"Hair\", \"Face\", \"FaceEyeline\", ...; generic:
-  material name keywords)."
+  material name keywords).
+
+  Real bug fix (/loop maturity pass, ADR-2607031200): checks `mesh-name`
+  ALONE first, before falling back to the combined mesh+node+material blob.
+  Confirmed against a real production VRM (not committed; a hand-built
+  synthetic fixture reproduces the same shape) that the old combined-blob-
+  first approach mis-classified a mesh literally named \"wear\" (clothing) as
+  `:face`, because ONE of its many attached materials happened to be named
+  \"robo_face\" (a visor/faceplate texture -- coincidental substring, not a
+  facial feature) -- a false positive from a keyword match on unrelated
+  material soup outranking the mesh's own, much stronger, direct name. A
+  mesh's own name is VRoid Studio's most reliable signal (it consistently
+  names meshes \"Hair\"/\"Body\"/\"Face\"/\"Wear\" directly); material/node
+  names are only consulted as a fallback when the mesh name alone gives no
+  match (e.g. a generic mesh name with descriptive material names)."
   [mesh-name material-names node-name]
-  (let [combined (clojure.string/lower-case
-                  (str mesh-name " " node-name " " (clojure.string/join " " material-names)))
-        has? (fn [s] (clojure.string/includes? combined s))]
-    (cond
-      (or (has? "hair") (has? "bangs")) :hair
-      (or (has? "face") (has? "eye") (has? "mouth") (has? "brow")) :face
-      (or (has? "body") (has? "skin")) :body
-      (or (has? "cloth") (has? "outfit") (has? "shirt") (has? "pants")
-          (has? "dress") (has? "shoe") (has? "tops") (has? "bottoms")) :outfit
-      (or (has? "accessory") (has? "hat") (has? "glass") (has? "ribbon")
-          (has? "earring") (has? "necklace")) :accessory
-      :else :other)))
+  (let [lower (fn [s] (clojure.string/lower-case (or s "")))
+        mesh-name-lower (lower mesh-name)]
+    (or (match-category mesh-name-lower category-keywords)
+        (let [combined (clojure.string/lower-case
+                        (str mesh-name " " node-name " " (clojure.string/join " " material-names)))]
+          (match-category combined category-keywords))
+        :other)))
 
 (defn- collect-material-textures
   "Collect texture indices referenced by a glTF material map into `textures`

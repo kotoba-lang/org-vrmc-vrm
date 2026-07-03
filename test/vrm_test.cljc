@@ -42,7 +42,12 @@
                                   :meta {:name "TestAvatar" :authors ["test"]
                                          :licenseUrl "https://vrm.dev/licenses/1.0/"
                                          :avatarPermission "everyone"}
-                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}
+                                  ;; real VRM 1.0 morphTargetBind schema: {node index weight}
+                                  ;; (vrm-specification/VRMC_vrm-1.0/expressions.md) -- node 1
+                                  ;; ("Hips") has :mesh 0, so this should resolve to mesh-index 0.
+                                  :expressions {:preset {:happy {:isBinary false
+                                                                  :morphTargetBinds [{:node 1 :index 0 :weight 1.0}]}}}}}}
         f32->bytes (fn [f] (glb/u32->le-bytes
                             #?(:clj (Float/floatToIntBits (float f))
                                :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
@@ -95,3 +100,25 @@
   (let [doc (vrm/parse-vrm (make-test-vrm))
         skeleton (humanoid/to-kami-skeleton doc)]
     (is (= 3 (count (:bones skeleton))))))
+
+;; Real bug fix (/loop maturity pass, ADR-2607031200): VRM 1.0's
+;; morphTargetBinds.node is a NODE index that must resolve to that node's
+;; :mesh -- parse-single-expression used to read a nonexistent `:mesh` key
+;; directly (VRM 0.x's *different* blendshape schema genuinely does use
+;; `:mesh`, which is why `vrm.compat`'s parallel code was correct and
+;; untouched), so morph-target-binds silently parsed empty for every real
+;; VRM 1.0 file -- confirmed against a real production VRM during this
+;; session's investigation. No existing fixture in this suite ever set
+;; :expressions at all, so nothing caught it until now.
+(deftest expression-morph-target-bind-resolves-node-to-mesh
+  (testing "a VRM 1.0 morphTargetBind's :node resolves to that node's :mesh"
+    (let [doc (vrm/parse-vrm (make-test-vrm))
+          happy (first (filter #(= :happy (:preset %)) (:expressions doc)))]
+      (is (some? happy))
+      (is (= 1 (count (:morph-target-binds happy))))
+      (let [bind (first (:morph-target-binds happy))]
+        ;; node 1 ("Hips") has :mesh 0 in the fixture -- this must resolve
+        ;; to mesh-index 0, not silently drop the bind.
+        (is (= 0 (:mesh-index bind)))
+        (is (= 0 (:morph-index bind)))
+        (is (= 1.0 (:weight bind)))))))

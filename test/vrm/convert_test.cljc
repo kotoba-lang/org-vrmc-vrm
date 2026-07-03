@@ -49,3 +49,102 @@
           doc (doc-with-vec3-accessor vs)
           decoded (conv/read-accessor-f32 doc 0)]
       (is (= (* (count vs) 3) (count decoded))))))
+
+;; ── read-base-color-texture (new for the /loop maturity pass' MToon-adjacent
+;; texture work — real VRM faces are painted via a baseColorTexture, not
+;; vertex colour) ──────────────────────────────────────────────────────────
+
+(defn- doc-with-textured-material [image-bytes mime]
+  {:gltf {:materials [{:pbrMetallicRoughness {:baseColorTexture {:index 0}}}
+                       {}] ;; material 1 has no texture — the "nil" case
+          :textures [{:source 0}]
+          :images [{:mimeType mime :bufferView 0}]
+          :bufferViews [{:buffer 0 :byteOffset 3 :byteLength (count image-bytes)}]}
+   ;; 3 leading pad bytes (a stand-in for other buffer content living before
+   ;; this image in a real GLB's single shared binary chunk) to prove
+   ;; byteOffset is honoured, not assumed zero.
+   :bin (vec (concat [0xAA 0xBB 0xCC] image-bytes))})
+
+(deftest read-base-color-texture-resolves-embedded-image-test
+  (testing "material -> texture -> image -> bufferView-embedded bytes, honouring byteOffset"
+    (let [fake-png [0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A] ;; real PNG magic
+          doc (doc-with-textured-material fake-png "image/png")
+          result (conv/read-base-color-texture doc 0)]
+      (is (some? result))
+      (is (= "image/png" (:mime-type result)))
+      (is (= fake-png (:bytes result))))))
+
+(deftest read-base-color-texture-nil-when-no-texture-test
+  (testing "a material with no baseColorTexture returns nil, not an error"
+    (let [doc (doc-with-textured-material [0x00] "image/png")]
+      (is (nil? (conv/read-base-color-texture doc 1))))))
+
+(deftest read-base-color-texture-nil-for-uri-image-test
+  (testing "a :uri-referenced (external, not GLB-embedded) image returns nil rather than throwing"
+    (let [doc {:gltf {:materials [{:pbrMetallicRoughness {:baseColorTexture {:index 0}}}]
+                       :textures [{:source 0}]
+                       :images [{:uri "external.png"}]
+                       :bufferViews []}
+               :bin []}]
+      (is (nil? (conv/read-base-color-texture doc 0))))))
+
+;; ── sparse accessor support (/loop maturity pass, ADR-2607031200) ──────────
+;; VRoid Studio's standard compact blend-shape encoding: only the vertices a
+;; morph target actually moves are stored, overlaid on a base array. Real bug
+;; fix: `read-accessor-f32` used to throw "accessor out of range" on any
+;; bufferView-less (sparse-only) accessor -- confirmed against a real
+;; production VRM 1.0 file during this session's investigation (never
+;; committed; only these hand-built synthetic fixtures are).
+
+(defn- doc-with-sparse-vec3-accessor
+  "`base-vs` (dense base, or `nil` for a sparse-only/no-bufferView accessor)
+  overlaid with `overlay` (a seq of `[index [x y z]]` pairs) via a real
+  glTF sparse accessor. `idx-component-type` lets tests exercise all three
+  legal `sparse.indices.componentType`s (unsigned byte/short/int)."
+  [base-vs overlay idx-component-type elem-count]
+  (let [has-base? (some? base-vs)
+        base-bin (if has-base? (vec (mapcat (fn [v] (mapcat f32->le-bytes v)) base-vs)) [])
+        idx-bytes-fn (case idx-component-type
+                       5121 (fn [i] [i])
+                       5123 (fn [i] [(bit-and i 0xFF) (bit-and (bit-shift-right i 8) 0xFF)])
+                       5125 (fn [i] [(bit-and i 0xFF) (bit-and (bit-shift-right i 8) 0xFF)
+                                     (bit-and (bit-shift-right i 16) 0xFF) (bit-and (bit-shift-right i 24) 0xFF)]))
+        idx-bin (vec (mapcat (fn [[i _]] (idx-bytes-fn i)) overlay))
+        val-bin (vec (mapcat (fn [[_ v]] (mapcat f32->le-bytes v)) overlay))
+        base-len (count base-bin)
+        idx-off base-len
+        idx-len (count idx-bin)
+        val-off (+ idx-off idx-len)
+        bvs (if has-base?
+              [{:buffer 0 :byteOffset 0 :byteLength base-len}
+               {:buffer 0 :byteOffset idx-off :byteLength idx-len}
+               {:buffer 0 :byteOffset val-off :byteLength (count val-bin)}]
+              [{:buffer 0 :byteOffset idx-off :byteLength idx-len}
+               {:buffer 0 :byteOffset val-off :byteLength (count val-bin)}])
+        [idx-bv-idx val-bv-idx] (if has-base? [1 2] [0 1])]
+    {:gltf {:accessors [(cond-> {:componentType gt/component-type-float :count elem-count :type "VEC3"
+                                  :sparse {:count (count overlay)
+                                           :indices {:bufferView idx-bv-idx :componentType idx-component-type}
+                                           :values {:bufferView val-bv-idx}}}
+                          has-base? (assoc :bufferView 0))]
+            :bufferViews bvs}
+     :bin (vec (concat base-bin idx-bin val-bin))}))
+
+(deftest sparse-accessor-no-base-bufferview-test
+  (testing "a sparse-only accessor (no :bufferView of its own) starts from an implicit zero base"
+    (let [doc (doc-with-sparse-vec3-accessor nil [[1 [2.0 -3.0 4.0]]] 5123 3)
+          decoded (conv/read-accessor-f32 doc 0)]
+      (is (= [0.0 0.0 0.0  2.0 -3.0 4.0  0.0 0.0 0.0] decoded)))))
+
+(deftest sparse-accessor-overlays-dense-base-test
+  (testing "a sparse overlay replaces only the indexed elements of a real dense base"
+    (let [base [[1.0 1.0 1.0] [1.0 1.0 1.0] [1.0 1.0 1.0] [1.0 1.0 1.0]]
+          doc (doc-with-sparse-vec3-accessor base [[0 [9.0 9.0 9.0]] [3 [-5.0 0.0 5.0]]] 5121 4)
+          decoded (conv/read-accessor-f32 doc 0)]
+      (is (= [9.0 9.0 9.0  1.0 1.0 1.0  1.0 1.0 1.0  -5.0 0.0 5.0] decoded)))))
+
+(deftest sparse-accessor-unsigned-int-indices-test
+  (testing "sparse.indices.componentType UNSIGNED_INT (5125) reads correctly"
+    (let [doc (doc-with-sparse-vec3-accessor nil [[2 [7.0 8.0 9.0]]] 5125 5)
+          decoded (conv/read-accessor-f32 doc 0)]
+      (is (= [0.0 0.0 0.0  0.0 0.0 0.0  7.0 8.0 9.0  0.0 0.0 0.0  0.0 0.0 0.0] decoded)))))

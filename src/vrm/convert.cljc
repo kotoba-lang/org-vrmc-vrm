@@ -34,45 +34,109 @@
           (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
           (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24)))
 
+(defn- elem-size-of [component-type]
+  (cond
+    (= component-type gt/component-type-float) 4
+    (= component-type gt/component-type-unsigned-short) 2
+    (= component-type gt/component-type-unsigned-byte) 1
+    (= component-type gt/component-type-unsigned-int) 4
+    :else 4))
+
+(defn- read-component-f64
+  "Read one scalar component of `component-type` at byte offset `o` in `bin`,
+  as a double (the shared per-type read this fn's callers all need)."
+  [bin o component-type]
+  (let [sz (elem-size-of component-type)]
+    (when (> (+ o sz) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
+    (cond
+      (= component-type gt/component-type-float) (double (read-f32-le bin o))
+      (= component-type gt/component-type-unsigned-short) (double (read-u16-le bin o))
+      (= component-type gt/component-type-unsigned-byte) (double (bit-and (nth bin o) 0xFF))
+      (= component-type gt/component-type-unsigned-int) (double (bit-and (read-u32-le bin o) 0xFFFFFFFF))
+      :else 0.0)))
+
+(defn- read-uint
+  "Read one unsigned integer of `component-type` at byte offset `o` -- for
+  sparse-accessor `indices` (always UNSIGNED_BYTE/SHORT/INT per the glTF
+  spec, never FLOAT), so this returns a plain `long`, not a double."
+  [bin o component-type]
+  (cond
+    (= component-type gt/component-type-unsigned-byte) (bit-and (nth bin o) 0xFF)
+    (= component-type gt/component-type-unsigned-short) (read-u16-le bin o)
+    (= component-type gt/component-type-unsigned-int) (bit-and (read-u32-le bin o) 0xFFFFFFFF)
+    :else (throw (ex-info "invalid sparse accessor: indices componentType must be unsigned byte/short/int"
+                           {:component-type component-type}))))
+
+(defn- read-dense-accessor-f32
+  "The original (pre-sparse-accessor-support) dense read: every one of
+  `count` elements stored contiguously (respecting `byteStride`) starting at
+  `bufferView.byteOffset + accessor.byteOffset`. Returns a flat vector,
+  `count * components` doubles long."
+  [bin bv acc components elem-size]
+  (let [default-stride (* components elem-size)
+        stride (or (:byteStride bv) default-stride)
+        base (+ (or (:byteOffset bv) 0) (or (:byteOffset acc) 0))]
+    (vec
+     (for [i (range (:count acc)) c (range components)]
+       (read-component-f64 bin (+ base (* i stride) (* c elem-size)) (:componentType acc))))))
+
 (defn read-accessor-f32
   "Read typed data from a glTF accessor in the BIN chunk as a flat f32 vector.
-  Supports FLOAT, UNSIGNED_SHORT, UNSIGNED_INT, UNSIGNED_BYTE component types."
+  Supports FLOAT, UNSIGNED_SHORT, UNSIGNED_INT, UNSIGNED_BYTE component types.
+
+  Supports glTF **sparse accessors** (`accessor.sparse`) -- VRoid Studio's
+  standard compact blend-shape encoding, where only the vertices a morph
+  target actually moves are stored (e.g. `count: 500` out of a 4332-vertex
+  mesh), overlaid on a base array. Per the glTF 2.0 spec: the base is either
+  the accessor's own dense `:bufferView` data if present, or an implicit
+  all-zero array of `count * components` if the accessor has no
+  `:bufferView` of its own (sparse-only, the common VRoid case). Then
+  `sparse.count` (index, value) pairs -- `sparse.indices` (element index,
+  read as `sparse.indices.componentType`: UNSIGNED_BYTE/SHORT/INT) and
+  `sparse.values` (the replacement element, `components` scalars of the
+  accessor's OWN componentType) -- overwrite that element's full value in
+  the base array. A real bug fix (/loop maturity pass, ADR-2607031200):
+  calling this on a sparse accessor used to throw \"accessor out of range\"
+  (a bufferView-less accessor was treated as malformed), which silently
+  broke every real-world VRoid-authored morph target."
   [doc accessor-idx]
   (let [gltf (:gltf doc)
         acc (get (:accessors gltf) accessor-idx)]
     (when-not acc (throw (ex-info "accessor out of range" {:index accessor-idx})))
-    (let [bv-idx (:bufferView acc)]
-      (when-not bv-idx (throw (ex-info "accessor out of range" {:index accessor-idx})))
-      (let [bv (get (:bufferViews gltf) bv-idx)]
-        (when-not bv (throw (ex-info "buffer view out of range" {:index bv-idx})))
-        (let [components (case (:type acc) "SCALAR" 1 "VEC2" 2 "VEC3" 3 "VEC4" 4 "MAT4" 16 1)
-              elem-size (cond
-                          (= (:componentType acc) gt/component-type-float) 4
-                          (= (:componentType acc) gt/component-type-unsigned-short) 2
-                          (= (:componentType acc) gt/component-type-unsigned-byte) 1
-                          (= (:componentType acc) gt/component-type-unsigned-int) 4
-                          :else 4)
-              default-stride (* components elem-size)
-              stride (or (:byteStride bv) default-stride)
-              base (+ (or (:byteOffset bv) 0) (or (:byteOffset acc) 0))
-              bin (:bin doc)]
-          (vec
-           (for [i (range (:count acc)) c (range components)]
-             (let [o (+ base (* i stride) (* c elem-size))]
-               (cond
-                 (= (:componentType acc) gt/component-type-float)
-                 (do (when (> (+ o 4) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
-                     (read-f32-le bin o))
-                 (= (:componentType acc) gt/component-type-unsigned-short)
-                 (do (when (> (+ o 2) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
-                     (double (read-u16-le bin o)))
-                 (= (:componentType acc) gt/component-type-unsigned-byte)
-                 (do (when (> (+ o 1) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
-                     (double (bit-and (nth bin o) 0xFF)))
-                 (= (:componentType acc) gt/component-type-unsigned-int)
-                 (do (when (> (+ o 4) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
-                     (double (bit-and (read-u32-le bin o) 0xFFFFFFFF)))
-                 :else 0.0)))))))))
+    (let [bv-idx (:bufferView acc)
+          sparse (:sparse acc)]
+      (when (and (not bv-idx) (not sparse))
+        (throw (ex-info "accessor out of range" {:index accessor-idx})))
+      (let [bin (:bin doc)
+            components (case (:type acc) "SCALAR" 1 "VEC2" 2 "VEC3" 3 "VEC4" 4 "MAT4" 16 1)
+            elem-size (elem-size-of (:componentType acc))
+            base-values
+            (if bv-idx
+              (let [bv (get (:bufferViews gltf) bv-idx)]
+                (when-not bv (throw (ex-info "buffer view out of range" {:index bv-idx})))
+                (read-dense-accessor-f32 bin bv acc components elem-size))
+              (vec (repeat (* (:count acc) components) 0.0)))]
+        (if-not sparse
+          base-values
+          (let [{:keys [count indices values]} sparse
+                idx-bv (get (:bufferViews gltf) (:bufferView indices))
+                val-bv (get (:bufferViews gltf) (:bufferView values))]
+            (when-not idx-bv (throw (ex-info "buffer view out of range" {:index (:bufferView indices)})))
+            (when-not val-bv (throw (ex-info "buffer view out of range" {:index (:bufferView values)})))
+            (let [idx-comp-type (:componentType indices)
+                  idx-elem-size (elem-size-of idx-comp-type)
+                  idx-base (+ (or (:byteOffset idx-bv) 0) (or (:byteOffset indices) 0))
+                  val-base (+ (or (:byteOffset val-bv) 0) (or (:byteOffset values) 0))]
+              (reduce
+               (fn [out i]
+                 (let [elem-idx (read-uint bin (+ idx-base (* i idx-elem-size)) idx-comp-type)
+                       elem-off (* i components elem-size)]
+                   (reduce
+                    (fn [out c]
+                      (let [v (read-component-f64 bin (+ val-base elem-off (* c elem-size)) (:componentType acc))]
+                        (assoc out (+ (* elem-idx components) c) v)))
+                    out (range components))))
+               base-values (range count)))))))))
 
 (defn extract-primitive-mesh
   "Extract interleaved vertex data (pos3+norm3+uv2 = 8 floats/vertex) from a
@@ -102,3 +166,36 @@
                         (mapv long (read-accessor-f32 doc idx-acc))
                         (vec (range vertex-count)))]
           {:vertices vertices :indices indices})))))
+
+(defn read-base-color-texture
+  "`material-idx` -> `{:bytes [u8 ...] :mime-type \"image/png\"}` for that
+  material's base glTF `pbrMetallicRoughness.baseColorTexture` (not any
+  VRMC_materials_mtoon extension texture — this is the plain glTF PBR path,
+  which every VRM 1.0 file has as a fallback even when it also carries MToon
+  extension data). `nil` if the material has no baseColorTexture, or the
+  resolved image is `:uri`-referenced (an external file, not embedded in
+  this GLB's binary chunk) rather than `:bufferView`-embedded — GLB-embedded
+  is the common case for a self-contained .vrm and the only one this reads;
+  loading an external URI is a caller concern (`fetch`, filesystem, ...), out
+  of scope for this pure accessor-shaped fn.
+
+  Real glTF material->texture->image chain: `materials[i].pbrMetallicRoughness
+  .baseColorTexture.index` -> a TEXTURE index (not an accessor) ->
+  `textures[j].source` -> an IMAGE index -> `images[k]` is either
+  `{:mimeType :bufferView}` (embedded, this fn's supported case) or
+  `{:uri ...}` (external, returns nil)."
+  [doc material-idx]
+  (let [gltf (:gltf doc)
+        material (get (:materials gltf) material-idx)
+        tex-idx (get-in material [:pbrMetallicRoughness :baseColorTexture :index])]
+    (when tex-idx
+      (let [texture (get (:textures gltf) tex-idx)
+            image-idx (:source texture)
+            image (get (:images gltf) image-idx)]
+        (when (and image (:bufferView image))
+          (let [bv (get (:bufferViews gltf) (:bufferView image))
+                start (or (:byteOffset bv) 0)
+                len (:byteLength bv)
+                bin (:bin doc)]
+            {:bytes (vec (subvec (vec bin) start (+ start len)))
+             :mime-type (or (:mimeType image) "image/png")}))))))

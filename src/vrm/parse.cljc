@@ -57,10 +57,31 @@
                    (vt/vrm-human-bone bone-name node))))
              human-bones-obj)))))
 
-(defn- parse-single-expression [nm val preset]
+(defn- node->mesh-index
+  "glTF node index -> the mesh index that node references, or nil. VRM 1.0's
+  `morphTargetBinds[].node` is a NODE index (a node has its own optional
+  `:mesh`), not a mesh index directly -- this differs from VRM 0.x's
+  `blendShapeMaster` binds, whose `mesh` field genuinely IS a mesh index per
+  its own schema (`vrm.blendshape.bind.schema.json`), so `vrm.compat`'s
+  parallel `(:mesh b)` read is correct as-is and untouched by this fix."
+  [gltf node-idx]
+  (get-in gltf [:nodes node-idx :mesh]))
+
+(defn- parse-single-expression [gltf nm val preset]
   (let [morph-target-binds (keep (fn [b]
-                                    (when (and (:mesh b) (:index b))
-                                      (vt/morph-target-bind (:mesh b) (:index b) (double (or (:weight b) 1.0)))))
+                                    ;; Real bug fix: VRM 1.0's morphTargetBind schema is
+                                    ;; `{node index weight}` (see vrm-specification/
+                                    ;; VRMC_vrm-1.0/expressions.md) -- this used to read
+                                    ;; `(:mesh b)`, a field that does not exist in real VRM
+                                    ;; 1.0 JSON, so morph-target-binds was silently empty for
+                                    ;; every real-world VRM 1.0 file (confirmed against a real
+                                    ;; production VRM during this session's /loop maturity
+                                    ;; pass; this repo's own test fixtures happened to use the
+                                    ;; same wrong key consistently, so they never caught it).
+                                    (when-let [node-idx (:node b)]
+                                      (when-let [mesh-idx (node->mesh-index gltf node-idx)]
+                                        (when (:index b)
+                                          (vt/morph-target-bind mesh-idx (:index b) (double (or (:weight b) 1.0)))))))
                                   (:morphTargetBinds val))
         material-color-binds (keep (fn [b]
                                       (when-let [tv (:targetValue b)]
@@ -95,12 +116,12 @@
       :override-look-at (parse-override :overrideLookAt)
       :override-mouth (parse-override :overrideMouth)})))
 
-(defn- parse-expressions-v1 [vrmc]
+(defn- parse-expressions-v1 [gltf vrmc]
   (if-let [expressions (:expressions vrmc)]
     (vec (concat
-          (map (fn [[nm val]] (parse-single-expression nm val (vt/str->expression-preset (clojure.core/name nm))))
+          (map (fn [[nm val]] (parse-single-expression gltf nm val (vt/str->expression-preset (clojure.core/name nm))))
                (:preset expressions))
-          (map (fn [[nm val]] (parse-single-expression nm val nil))
+          (map (fn [[nm val]] (parse-single-expression gltf nm val nil))
                (:custom expressions))))
     []))
 
@@ -230,7 +251,7 @@
       (when-not vrmc-vrm (throw (ex-info "missing required extension: VRMC_vrm" {})))
       (let [meta (parse-meta-v1 vrmc-vrm)
             humanoid (parse-humanoid-v1 vrmc-vrm)
-            expressions (parse-expressions-v1 vrmc-vrm)
+            expressions (parse-expressions-v1 gltf vrmc-vrm)
             look-at (parse-look-at-v1 vrmc-vrm)
             first-person (parse-first-person-v1 vrmc-vrm)
             [spring-bones spring-bone-colliders spring-bone-collider-groups]

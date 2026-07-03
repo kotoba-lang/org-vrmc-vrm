@@ -93,7 +93,42 @@
     (is (seq (:json chunks)))
     (let [reparsed (vrm/parse-vrm output)]
       (is (= "TestAvatar" (:name (:meta reparsed))))
-      (is (>= (count (:human-bones (:humanoid reparsed))) 2)))))
+      (is (>= (count (:human-bones (:humanoid reparsed))) 2)))
+    ;; Real bug fix regression guard (/loop maturity pass): every `source`
+    ;; here shares the SAME `doc` (both the "Body" and "Hair" parts come from
+    ;; one parsed test VRM) -- exactly the shape a real character-creator mix
+    ;; produces when multiple picked categories come from one uploaded file.
+    ;; Before the fix, `compose`'s buffer-merge concatenated a shared source
+    ;; document's full `:bin` once PER PART referencing it (2x here, since 2
+    ;; parts share 1 doc) instead of once per UNIQUE document -- confirmed via
+    ;; a real two-file measurement that exported 54MB from ~21MB of actual
+    ;; source data (exactly 4x one file's :bin + 1x the other's, matching 4
+    ;; parts sharing one doc + 1 part from the second). The composed `:bin`
+    ;; must equal the ORIGINAL doc's `:bin` length exactly here, not some
+    ;; multiple of it.
+    (is (= (count (:bin doc)) (count (:bin composed)))
+        "composed :bin must not duplicate a source document shared by multiple parts")))
+
+;; Document-dedup fix, isolated: two parts from the SAME doc (already covered
+;; above) vs. parts genuinely spanning two DIFFERENT docs -- this asserts the
+;; dedup-by-`identical?` fix doesn't over-merge distinct documents that just
+;; happen to be structurally similar (a second, separately-parsed instance of
+;; the exact same bytes is a DIFFERENT object, must NOT be deduped away).
+(deftest compose-distinct-docs-not-deduped
+  (let [bytes (make-test-vrm)
+        doc-a (vrm/parse-vrm bytes)
+        doc-b (vrm/parse-vrm bytes) ;; a second, separate parse of the same bytes -- NOT `identical?` to doc-a
+        parts-a (vrm/decompose doc-a)
+        parts-b (vrm/decompose doc-b)
+        body-a (some #(when (= :body (:category %)) %) parts-a)
+        hair-b (some #(when (= :hair (:category %)) %) parts-b)
+        sources [{:part body-a :doc doc-a} {:part hair-b :doc doc-b}]
+        composed (vrm/compose-parts sources {:skeleton-base 0})]
+    ;; two genuinely distinct (non-identical!) doc instances -> both must be
+    ;; merged, so composed :bin is the sum of both, not deduped down to one.
+    (is (= (+ (count (:bin doc-a)) (count (:bin doc-b))) (count (:bin composed)))
+        "two distinct doc instances (even with identical bytes) must both be merged, not deduped")
+    (is (= 2 (count (get-in composed [:gltf :meshes]))))))
 
 ;; mirrors `skeleton_extraction`
 (deftest skeleton-extraction

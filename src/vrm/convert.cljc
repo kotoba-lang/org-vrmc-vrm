@@ -6,11 +6,20 @@
   (:require [vrm.gltf-types :as gt]))
 
 (defn- read-f32-le [bin o]
+  ;; `bit-or`/`bit-shift-left` operate on Clojure `long`s, so a set top bit
+  ;; (any negative float, or a huge-magnitude one) produces a value > Integer/
+  ;; MAX_VALUE; `Float/intBitsToFloat` requires a genuine 32-bit `int`, and
+  ;; Clojure's auto-narrowing throws ArithmeticException instead of wrapping.
+  ;; `unchecked-int` does the two's-complement truncation Rust's `f32::from_bits`
+  ;; gets for free from `u32` — this is a real bug fix (any negative vertex
+  ;; coordinate crashes `read-accessor-f32` on JVM without it), not a port
+  ;; deviation: the CLJS branch below was already correct via DataView.
   #?(:clj (Float/intBitsToFloat
-           (bit-or (bit-and (nth bin o) 0xFF)
-                   (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)
-                   (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
-                   (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24)))
+           (unchecked-int
+            (bit-or (bit-and (nth bin o) 0xFF)
+                    (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)
+                    (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
+                    (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24))))
      :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
              (.setUint8 view 0 (nth bin o)) (.setUint8 view 1 (nth bin (+ o 1)))
              (.setUint8 view 2 (nth bin (+ o 2))) (.setUint8 view 3 (nth bin (+ o 3)))

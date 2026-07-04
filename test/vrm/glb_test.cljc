@@ -30,3 +30,27 @@
 (deftest too-short
   (is (thrown? #?(:clj Exception :cljs js/Error) (glb/parse-glb [])))
   (is (thrown? #?(:clj Exception :cljs js/Error) (glb/parse-glb (vec (repeat 8 0))))))
+
+;; ---------------------------------------------------------------------------
+;; ADR-0048 §5 migration regression — vrm.glb/parse-glb + write-glb now
+;; delegate to kotoba-lang/glb's raw tier (glb/parse-glb-raw, glb/write-glb-raw)
+;; instead of hand-rolling chunk framing here. This pins the exact byte output
+;; for a fixed (non-4-byte-aligned, so padding is actually exercised) input
+;; against the pre-migration implementation's own output, verified identical
+;; via a local A/B diff against commit 9b7201d (this repo's HEAD immediately
+;; before this migration) during the migration itself — the literal below is
+;; that verified pre-migration output — so any future accidental change to
+;; chunk framing is caught here, not just by "roundtrips with itself."
+;; ---------------------------------------------------------------------------
+
+(deftest write-glb-migration-regression
+  (let [json (glb/string->byte-seq "{\"asset\":{\"version\":\"2.0\"},\"extensionsUsed\":[\"VRMC_vrm\"]}")
+        bin (vec (range 0 37)) ;; unaligned -> exercises bin zero-padding
+        out (glb/write-glb json bin)]
+    (is (= [103 108 84 70 2 0 0 0 128 0 0 0 60 0 0 0 74 83 79 78 123 34 97 115
+            115 101 116 34 58 123 34 118 101 114 115 105 111 110 34 58 34 50
+            46 48 34 125 44 34 101 120 116 101 110 115 105 111 110 115 85 115
+            101 100 34 58 91 34 86 82 77 67 95 118 114 109 34 93 125 32 32 32
+            40 0 0 0 66 73 78 0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18
+            19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 0 0 0]
+           (vec out)))))

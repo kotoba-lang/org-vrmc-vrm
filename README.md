@@ -20,7 +20,7 @@ per the zero-dependency restoration convention).
 | Namespace | Restored from | Lines | Purpose |
 |---|---|---|---|
 | `vrm` | `lib.rs` (250) | 78 | Root: pipeline docs, re-exports, error convention |
-| `vrm.glb` | `glb.rs` (166) | 113 | GLB binary container parse/write |
+| `vrm.glb` | `glb.rs` (166) | 113 | GLB binary container parse/write facade (see below, ADR-0048 §5) |
 | `vrm.gltf-types` | `gltf_types.rs` (292) | 53 | glTF 2.0 constants + document defaults |
 | `vrm.vrm-types` | `vrm_types.rs` (620) | 212 | VRM data shapes, humanoid/expression-preset tables |
 | `vrm.parse` | `parse.rs` (508) | 276 | VRM 1.0 GLB -> VrmDocument parser |
@@ -46,6 +46,22 @@ blocks in the original, so nothing to port there beyond the integration coverage
 Spring-bone physics and the node-constraint solver were additionally sanity-checked in the
 REPL (gravity pulling a hanging chain to a stable non-trivial rotation; a rotation
 constraint reproducing its source's delta) since neither had Rust unit tests to port.
+
+## GLB container framing (ADR-0048 §5)
+
+`vrm.glb`'s actual container framing (12-byte header + JSON chunk + BIN chunk, magic
+numbers, padding) used to be hand-rolled here — but the same format was *also*
+independently hand-rolled (write-only) in `kotoba-lang/gltf`, a real
+duplicated-implementation risk (ADR-0048 §5, `kotoba-lang/kami-engine`). `vrm.glb` is
+now a thin facade over **`kotoba-lang/glb`** (`:local/root "../glb"`, the single
+canonical GLB codec both repos depend on): `parse-glb`/`write-glb` delegate to
+`glb/parse-glb-raw`/`glb/write-glb-raw` (the raw, bytes-in/bytes-out tier — no JSON
+encode/decode, since this repo's own `vrm.json` still owns that), preserving the
+exact original call signatures (`parse-glb` still returns raw JSON chunk bytes, not
+a parsed map; `write-glb` still takes positional `(json bin)` byte-seq args), so
+every existing call site (`vrm.parse`, `vrm.export`, the tests) needed zero changes.
+`glb-magic`/`glb-version`/`chunk-json`/`chunk-bin`/`u32->le-bytes`/`string->byte-seq`/
+`byte-seq->string`/`pad-len` are now re-exports of `glb`'s canonical definitions.
 
 Platform divergence (little-endian f32 byte encoding for the GLB binary container) is
 isolated behind `#?(:clj ... :cljs ...)` reader conditionals; everything else is pure,

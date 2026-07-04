@@ -35,11 +35,26 @@
                (vec
                 (for [j (range 16)]
                   (let [o (+ start (* j 4))]
+                    ;; `unchecked-int`: same real bug fix as vrm.convert/read-f32-le
+                    ;; (commit 58e4044) -- `bit-or`/`bit-shift-left` operate on Clojure
+                    ;; `long`s, so a set top bit (any negative float, e.g. a translation
+                    ;; component on the "far" side of the origin) produces a value >
+                    ;; Integer/MAX_VALUE; `Float/intBitsToFloat` requires a genuine
+                    ;; 32-bit `int`, and Clojure's auto-narrowing throws
+                    ;; ArithmeticException instead of wrapping. This copy of the same
+                    ;; byte-assembly pattern was never patched when convert.cljc's was --
+                    ;; any real inverse-bind matrix with a negative translation (i.e.
+                    ;; almost any real humanoid skeleton) crashed `to-kami-skeleton` on
+                    ;; JVM. Found via kotoba-lang/kami-gen-ml3d's round-trip test
+                    ;; (ADR-2607051120): exporting a synthesized skeleton with a
+                    ;; negative-translation inverse-bind matrix and re-parsing it via
+                    ;; `to-kami-skeleton` reproduced this deterministically.
                     #?(:clj (Float/intBitsToFloat
-                             (bit-or (bit-and (nth bin o) 0xFF)
-                                     (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)
-                                     (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
-                                     (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24)))
+                             (unchecked-int
+                              (bit-or (bit-and (nth bin o) 0xFF)
+                                      (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)
+                                      (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
+                                      (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24))))
                        :cljs (let [buf (js/ArrayBuffer. 4)
                                    view (js/DataView. buf)]
                                (.setUint8 view 0 (nth bin o))

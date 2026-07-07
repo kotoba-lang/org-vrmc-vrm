@@ -294,6 +294,111 @@
             (str "expected every component to be 2 (Head's unified position); got " (pr-str values)
                  " -- 0 would mean the raw donor-local value leaked through unremapped (binding hair to Root instead of Head)"))))))
 
+;; A base VRM authored with TWO SEPARATE SKINS -- the exact real-world pattern found
+;; in VRM Consortium's Seed-san (5 skins, one per mesh: hair/hair_tail/head/robo_arm/
+;; wear), which the old compose broke on entirely: only skin 0 was ever considered, so
+;; a base mesh using any OTHER skin failed the "no place in the unified skeleton"
+;; check against its OWN base document -- not a donor issue at all (Seed-san's real
+;; failure was its "wear"/body mesh, which uses skin 4, not skin 0). This fixture
+;; mirrors that shape precisely: the SOLE mesh (the one :body/:category will select)
+;; uses skin INDEX 1, not 0 -- skin 0 exists in the document (unused by any node,
+;; exactly as legal in glTF as Seed-san's other 4 skins being unrelated to any one
+;; given selected part) purely to prove joint-set unions ALL of the base's skins, not
+;; just whichever one happens to be first. skin0 = [Root Hips Head]; skin1 = [Hips
+;; OutfitBone] where OutfitBone is a 4th node in NEITHER skin0 nor the mesh's own node
+;; subtree -- Hips being in both skins exercises dedup (must not appear twice).
+(defn- make-test-vrm-multiskin-base []
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2 3]}
+                 {:name "Hips" :translation [0 0.8 0]}
+                 {:name "Head" :translation [0 1.4 0]}
+                 {:name "BodyNode" :mesh 0 :skin 1 :translation [0 0.6 0] :children [4]}
+                 {:name "OutfitBone" :translation [0 0.65 0]}]
+         :meshes [{:name "Body" :primitives [{:attributes {:POSITION 0 :JOINTS_0 2 :WEIGHTS_0 3}
+                                              :indices 1 :material 0}]}]
+         :materials [{:name "body_material" :pbrMetallicRoughness {:baseColorFactor [0.9 0.7 0.6 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.5 -0.5 -0.5] :max [0.5 0.5 0.5]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5121 :count 3 :type "VEC4"}
+                     {:bufferView 3 :componentType 5126 :count 3 :type "VEC4"}
+                     {:bufferView 4 :componentType 5126 :count 3 :type "MAT4"}
+                     {:bufferView 5 :componentType 5126 :count 2 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 12}
+                       {:buffer 0 :byteOffset 60 :byteLength 48}
+                       {:buffer 0 :byteOffset 108 :byteLength 192}
+                       {:buffer 0 :byteOffset 300 :byteLength 128}]
+         :buffers [{:byteLength 428}]
+         :skins [{:joints [0 1 2] :inverseBindMatrices 4}
+                 {:joints [1 4] :inverseBindMatrices 5}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "MultiSkinBase" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        body-pos (mapcat f32->bytes [-0.5 0.0 0.0 0.5 0.0 0.0 0.0 1.0 0.0])
+        body-idx (mapcat glb/u32->le-bytes [0 1 2])
+        ;; every Body vertex bound 100% to LOCAL position 1 in skin1 == OutfitBone.
+        joints-0 [1 0 0 0  1 0 0 0  1 0 0 0]
+        weights-0 (mapcat (fn [_] (mapcat f32->bytes [1.0 0.0 0.0 0.0])) (range 3))
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        skin0-ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 3))
+        ;; skin1's OutfitBone (local position 1) gets a distinctive, real, non-identity
+        ;; IBM -- translation [5 6 7] -- to prove the composed accessor carries THIS
+        ;; skin's actual data, not skin0's or a placeholder.
+        outfit-bone-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 5.0 6.0 7.0 1.0]
+        skin1-ibm (mapcat f32->bytes (concat identity-mat4 outfit-bone-mat4))
+        bin (vec (concat body-pos body-idx joints-0 weights-0 skin0-ibm skin1-ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+(deftest compose-unifies-a-base-authored-with-multiple-skins
+  (let [doc (vrm/parse-vrm (make-test-vrm-multiskin-base))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose doc))
+        sources [{:part body-part :doc doc}]
+        composed (vrm/compose-parts sources {:skeleton-base 0})
+        skin (first (get-in composed [:gltf :skins]))]
+    (testing "the selected mesh's own skin (index 1, NOT skin 0) is honored -- the exact real Seed-san failure shape (its selected 'wear' mesh uses skin 4)"
+      (is (some? body-part) "decompose must classify the Body mesh as :body for this test to exercise anything")
+      (is (= 4 (count (:joints skin)))
+          (str "expected Root/Hips/Head/OutfitBone (4, Hips shared by both skins counted once); got "
+               (pr-str (:joints skin)))))
+    (let [body-mesh (first (get-in composed [:gltf :meshes]))
+          joints-acc-idx (get-in body-mesh [:primitives 0 :attributes :JOINTS_0])
+          outfit-bone-unified-pos (.indexOf (:joints skin) 4) ;; node 4 = OutfitBone
+          hips-unified-pos (.indexOf (:joints skin) 1) ;; node 1 = Hips
+          values (vec (map #(int (Math/round (double %))) (conv/read-accessor-f32 composed joints-acc-idx)))
+          ;; every vertex's WEIGHTS_0 is [1 0 0 0] -- component 0 (raw local value 1 =
+          ;; OutfitBone) is the only slot with a real weight; components 1-3 (raw local
+          ;; value 0 = Hips, "don't care" since their weight is 0) should STILL resolve
+          ;; correctly to Hips's own unified position, not just "not crash".
+          first-components (take-nth 4 values)
+          other-components (remove (set first-components) values)]
+      (testing "the Body mesh's real (weighted) skin1-local position (1) correctly resolves to OutfitBone's UNIFIED position, not left as raw skin1-local or thrown as unmappable"
+        (is (every? #(= outfit-bone-unified-pos %) first-components)
+            (str "expected every weighted component to be " outfit-bone-unified-pos " (OutfitBone's unified position); got " (pr-str values))))
+      (testing "the zero-weight components (raw local value 0 = Hips) ALSO correctly resolve to Hips's own unified position, not left raw"
+        (is (every? #(= hips-unified-pos %) other-components)
+            (str "expected every zero-weight component to be " hips-unified-pos " (Hips's unified position); got " (pr-str values))))
+      (testing "the composed inverseBindMatrices accessor carries skin1's REAL OutfitBone data (translation [5 6 7]), not skin0's or a placeholder"
+        (let [ibm-idx (:inverseBindMatrices skin)
+              floats (conv/read-accessor-f32 composed ibm-idx)
+              row-start (* outfit-bone-unified-pos 16)]
+          (is (= [5.0 6.0 7.0 1.0] (subvec floats (+ row-start 12) (+ row-start 16)))))))))
+
 ;; A 4th synthetic VRM: same as the reversed-joints donor above, plus one more node
 ;; ("Unmappable" -- no humanoid bone, not a child of the Head/hair node, so genuinely
 ;; unreachable from either remap path) added as a 4th joint in the skin. Real content

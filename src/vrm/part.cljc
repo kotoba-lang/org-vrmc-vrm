@@ -1,7 +1,25 @@
 (ns vrm.part
   "VRM part decomposition: VrmDocument -> `[VrmPart ...]`. Restored from
   `kami-vrm/src/part.rs` (kotoba-lang/kami-engine, deleted PR #82) as part of
-  the clj-wgsl migration (ADR-2607010930, com-junkawasaki/root).")
+  the clj-wgsl migration (ADR-2607010930, com-junkawasaki/root)."
+  (:require [vrm.convert :as conv]))
+
+(defn- round-to-long [v]
+  #?(:clj (long (Math/round (double v))) :cljs (js/Math.round v)))
+
+(defn- mesh-node-referenced-joints
+  "Node-ids genuinely referenced by `node`'s own JOINTS_0 vertex data -- NOT a
+  skin's whole declared `:joints` palette (see `decompose`'s `skin-joint-seeds`
+  for why that distinction matters)."
+  [doc gltf meshes node]
+  (if-let [skin-joints (:joints (get (:skins gltf) (:skin node)))]
+    (distinct
+     (mapcat (fn [prim]
+               (when-let [joints-acc-idx (get-in prim [:attributes :JOINTS_0])]
+                 (let [raw (conv/read-accessor-f32 doc joints-acc-idx)]
+                   (keep #(nth skin-joints (round-to-long %) nil) raw))))
+             (:primitives (get meshes (:mesh node)))))
+    []))
 
 ;; Category tag for avatar parts.
 (def part-categories #{:body :hair :face :outfit :accessory :other})
@@ -114,8 +132,40 @@
              image-indices
              (vec (distinct
                    (keep (fn [tex-idx] (:source (get textures-doc tex-idx))) texture-indices)))
+             ;; Real content found composing net-babiniku's real avatar pair (VRM
+             ;; Consortium's VRM1_Constraint_Twist_Sample): a mesh's own SKIN can
+             ;; reference joints that are NOT descendants of the mesh's own node at
+             ;; all -- a common, legitimate VRM authoring pattern for secondary/
+             ;; spring-bone physics (a hair-sway bone chain is typically rigged as a
+             ;; child of whichever HUMANOID bone it hangs off of -- e.g. under Head,
+             ;; for correct base-pose inheritance -- not under the hair mesh's own
+             ;; node). Without seeding those joints too, such a bone has no place in
+             ;; a composed skeleton at all (org-vrmc-vrm/vrm.compose correctly THROWS
+             ;; rather than silently mis-binding a real, weighted skinning influence
+             ;; to the wrong joint). The fix belongs HERE, in decompose -- this is
+             ;; what defines "what nodes does this part touch" -- not in compose,
+             ;; which only ever consumes whatever decompose already decided.
+             ;;
+             ;; Seed only joints the mesh's OWN JOINTS_0 vertex data actually
+             ;; references -- NOT a skin's whole declared `:joints` palette. A skin
+             ;; is a shared glTF object; several meshes (or a mesh with sparse
+             ;; per-vertex usage) can point at the same skin while each only ever
+             ;; addresses a subset of its joint array. Seeding the entire palette
+             ;; unconditionally pulled in joints this mesh never actually binds to
+             ;; (e.g. a shared skin's Root entry with zero referencing vertices),
+             ;; over-growing the unified skeleton with nodes that have no real
+             ;; skinning purpose for this part. Reading the actual JOINTS_0 values
+             ;; (same decode `vrm.compose/remap-joints-accessor!` uses) targets
+             ;; exactly the nodes this mesh's vertices are bound to.
+             mesh-idx-set (set mesh-indices)
+             skin-joint-seeds
+             (vec (distinct
+                   (mapcat (fn [node]
+                             (when (contains? mesh-idx-set (:mesh node))
+                               (mesh-node-referenced-joints doc gltf meshes node)))
+                           nodes)))
              all-nodes
-             (loop [all-nodes (vec node-indices) i 0]
+             (loop [all-nodes (vec (distinct (into node-indices skin-joint-seeds))) i 0]
                (if (>= i (count all-nodes))
                  all-nodes
                  (let [ni (nth all-nodes i)

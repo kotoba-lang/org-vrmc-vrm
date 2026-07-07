@@ -159,33 +159,47 @@
           ;; ── Phase 1.5: joint-set (the unified skin's final joint list) ── computed
           ;; EARLY, right after node-remap, rather than after mesh merge -- Phase 3/4
           ;; below needs it (as `joint-index-of`) to remap donor meshes' per-vertex
-          ;; JOINTS_0 indices into unified positions. Logic unchanged from the original
-          ;; skin-rebuild phase, just relocated so mesh merge can see its result.
+          ;; JOINTS_0 indices into unified positions.
+          ;;
+          ;; EVERY skin any source document (base OR donor) actually uses contributes
+          ;; its joints -- not just "the base's first skin" and "each donor's first
+          ;; skin". A real bug this generalizes past (found via net-babiniku's M6
+          ;; slice-2 real part-swap, then precisely diagnosed via a direct JVM
+          ;; diagnostic against the actual file bytes): VRM Consortium's Seed-san is
+          ;; authored with ONE SKIN PER MESH (hair/hair_tail/head/robo_arm/wear -- 5
+          ;; skins total). The old code only ever looked at skin 0, so any base mesh
+          ;; using a DIFFERENT skin had joints joint-index-of simply didn't contain --
+          ;; even the base's OWN "wear" (body) mesh failed the "no place in the
+          ;; unified skeleton" check against its own base document. Not a donor issue
+          ;; at all. `node-remap` already carries identity entries for every one of
+          ;; base's own nodes (node-remap0's construction), so `(get node-remap
+          ;; [src-idx old-joint])` resolves correctly whether `src-idx` is
+          ;; skeleton-base or a donor -- no special-casing needed here.
           base-skin (first (:skins base-gltf))
           [joint-set ibm-plan]
-          (if-not base-skin
-            [nil nil]
-            (reduce
-             (fn [[joints plan] [src-idx src]]
-               (if (= src-idx skeleton-base)
-                 [joints plan]
-                 (if-let [src-skin (first (:skins (:gltf (:doc src))))]
-                   (reduce
-                    (fn [[joints plan] [old-pos old-joint]]
-                      (if-let [new-joint (get node-remap [src-idx old-joint])]
-                        (if (some #{new-joint} joints)
-                          [joints plan]
-                          [(conj joints new-joint) (conj plan {:src-idx src-idx :pos old-pos})])
-                        [joints plan]))
-                    [joints plan]
-                    (map-indexed vector (:joints src-skin)))
-                   [joints plan])))
-             [(vec (:joints base-skin))
-              (vec (map-indexed (fn [i _] {:src-idx skeleton-base :pos i}) (:joints base-skin)))]
-             (map-indexed vector sources)))
+          (reduce
+           (fn [[joints plan] [src-idx src]]
+             (let [doc (if (= src-idx skeleton-base) base-doc (:doc src))
+                   skins (get-in doc [:gltf :skins])]
+               (reduce
+                (fn [[joints plan] [skin-idx skin]]
+                  (reduce
+                   (fn [[joints plan] [old-pos old-joint]]
+                     (if-let [new-joint (get node-remap [src-idx old-joint])]
+                       (if (some #{new-joint} joints)
+                         [joints plan]
+                         [(conj joints new-joint)
+                          (conj plan {:src-idx src-idx :skin-idx skin-idx :pos old-pos})])
+                       [joints plan]))
+                   [joints plan]
+                   (map-indexed vector (:joints skin))))
+                [joints plan]
+                (map-indexed vector skins))))
+           [[] []]
+           (map-indexed vector sources))
           ;; unified node-id -> its position in joint-set, i.e. the value a remapped
           ;; JOINTS_0 vertex index (or a skin's own :joints lookup) should resolve to.
-          joint-index-of (when joint-set (into {} (map-indexed (fn [i j] [j i]) joint-set)))
+          joint-index-of (when (seq joint-set) (into {} (map-indexed (fn [i j] [j i]) joint-set)))
 
           ;; ── Phase 2: buffer merging ── (keyed by canonical doc index `ci`,
           ;; and SKIPPED entirely once a document's buffer/accessor data has
@@ -451,29 +465,36 @@
           ;; joint-palette builder reading past the end of that accessor's data once it
           ;; walked past the base's original joint count -- "No item 23 in vector of
           ;; length 23". A skin's joints and inverseBindMatrices must be the SAME
-          ;; length; when donor joints grow the list, a fresh accessor spanning the
-          ;; full joint-set (base IBMs first, then each donor's, in append order) is
-          ;; built and appended to the merged buffer -- not a shortcut around the real
-          ;; data, an accessor with the SAME real IBM values just concatenated.
-          skin-cache (atom {})
-          base-ibm-idx (when base-skin (:inverseBindMatrices base-skin))
-          base-ibm-floats (when base-ibm-idx (conv/read-accessor-f32 base-doc base-ibm-idx))
+          ;; length; when the joint list grows, a fresh accessor spanning the full
+          ;; joint-set (every joint's REAL IBM data, read from whichever specific skin
+          ;; -- base or donor, any index, per ibm-plan's :skin-idx -- it actually came
+          ;; from) is built and appended to the merged buffer -- not a shortcut around
+          ;; the real data, an accessor with the SAME real IBM values just concatenated.
+          doc-cache (atom {})
+          doc-for-plan (fn [src-idx]
+                         (if (= src-idx skeleton-base)
+                           base-doc
+                           (or (get @doc-cache src-idx)
+                               (let [d (:doc (nth sources src-idx))]
+                                 (swap! doc-cache assoc src-idx d)
+                                 d))))
           ibm-floats-for
-          (fn [{:keys [src-idx pos]}]
-            (if (= src-idx skeleton-base)
-              (subvec (or base-ibm-floats []) (* pos 16) (+ (* pos 16) 16))
-              (let [src-doc (:doc (nth sources src-idx))
-                    src-skin (or (get @skin-cache src-idx)
-                                 (let [s (first (:skins (:gltf src-doc)))]
-                                   (swap! skin-cache assoc src-idx s)
-                                   s))
-                    ibm-idx (:inverseBindMatrices src-skin)]
-                (if ibm-idx
-                  (subvec (conv/read-accessor-f32 src-doc ibm-idx) (* pos 16) (+ (* pos 16) 16))
-                  ;; No IBM data at all for this donor skin: identity, same fallback
-                  ;; `skin-joint-palette` already applies when a skin lacks one.
-                  [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]))))
-          grew? (and base-skin (> (count joint-set) (count (:joints base-skin))))
+          (fn [{:keys [src-idx skin-idx pos]}]
+            (let [doc (doc-for-plan src-idx)
+                  skin (get-in doc [:gltf :skins skin-idx])
+                  ibm-idx (:inverseBindMatrices skin)]
+              (if ibm-idx
+                (subvec (conv/read-accessor-f32 doc ibm-idx) (* pos 16) (+ (* pos 16) 16))
+                ;; No IBM data at all for this skin: identity, same fallback
+                ;; `skin-joint-palette` already applies when a skin lacks one.
+                [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0])))
+          ;; The base's own FIRST skin's IBM accessor can only be reused unchanged
+          ;; (fast path, no new accessor built) when joint-set is LITERALLY that skin's
+          ;; own joint list -- i.e. nothing else (a later base skin, or any donor)
+          ;; contributed anything. Any divergence at all means some entries in the
+          ;; final joint-set don't correspond 1:1 with that accessor's rows anymore.
+          base-ibm-idx (when base-skin (:inverseBindMatrices base-skin))
+          grew? (not= joint-set (vec (:joints base-skin)))
           [bin buffer-views accessors unified-skin]
           (cond
             (not base-skin) [bin buffer-views accessors nil]

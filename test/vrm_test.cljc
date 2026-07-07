@@ -6,7 +6,8 @@
             [vrm]
             [vrm.glb :as glb]
             [vrm.json :as json]
-            [vrm.humanoid :as humanoid]))
+            [vrm.humanoid :as humanoid]
+            [vrm.convert :as conv]))
 
 (deftest namespace-loads
   (testing "the restored CLJC namespace loads"
@@ -108,6 +109,105 @@
     ;; multiple of it.
     (is (= (count (:bin doc)) (count (:bin composed)))
         "composed :bin must not duplicate a source document shared by multiple parts")))
+
+;; A second synthetic VRM whose skin has a 4th joint ("HairTip", child of Head, no
+;; humanoid-bone mapping) that `make-test-vrm`'s skeleton doesn't have -- for the
+;; skin-inverseBindMatrices-growth test below. Its 4th (last) inverse bind matrix is a
+;; distinctive non-identity value (translation [9 8 7]) so the growth test can assert
+;; the EXACT donor data survived compose+export+reparse at the right position, not just
+;; that nothing threw.
+(defn- make-test-vrm-2 []
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2]}
+                 {:name "Hips" :mesh 0 :skin 0 :translation [0 0.8 0]}
+                 {:name "Head" :mesh 1 :skin 0 :translation [0 0.4 0] :children [3]}
+                 {:name "HairTip" :translation [0 0.1 0]}]
+         :meshes [{:name "Body" :primitives [{:attributes {:POSITION 0} :indices 1 :material 0}]}
+                  {:name "Hair" :primitives [{:attributes {:POSITION 2} :indices 3 :material 1}]}]
+         :materials [{:name "skin_material" :pbrMetallicRoughness {:baseColorFactor [0.9 0.7 0.6 1.0]}}
+                     {:name "hair_material" :pbrMetallicRoughness {:baseColorFactor [0.2 0.1 0.05 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.5 -0.5 -0.5] :max [0.5 0.5 0.5]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5126 :count 3 :type "VEC3" :min [-0.3 0.0 -0.3] :max [0.3 0.5 0.3]}
+                     {:bufferView 3 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 4 :componentType 5126 :count 4 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 36}
+                       {:buffer 0 :byteOffset 84 :byteLength 12}
+                       {:buffer 0 :byteOffset 96 :byteLength 256}]
+         :buffers [{:byteLength 352}]
+         :skins [{:joints [0 1 2 3] :inverseBindMatrices 4}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "DonorAvatar" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        body-pos (mapcat f32->bytes [-0.5 0.0 0.0 0.5 0.0 0.0 0.0 1.0 0.0])
+        body-idx (mapcat glb/u32->le-bytes [0 1 2])
+        hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
+        hair-idx (mapcat glb/u32->le-bytes [0 1 2])
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        ;; joints 0/1/2 (Root/Hips/Head): identity. Joint 3 (HairTip, the only one
+        ;; compose's fix ever reads from THIS donor): translation [9 8 7] -- distinctive
+        ;; and easy to assert on exactly.
+        hair-tip-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 9.0 8.0 7.0 1.0]
+        ibm (mapcat (fn [m] (mapcat f32->bytes m)) [identity-mat4 identity-mat4 identity-mat4 hair-tip-mat4])
+        bin (vec (concat body-pos body-idx hair-pos hair-idx ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+;; Real bug regression (net-babiniku ADR-2607071600 M6 slice-2, 2026-07-07): compose's
+;; skin rebuild used to reuse the BASE skin's own (shorter) inverseBindMatrices accessor
+;; unchanged even when donor parts grew the joint list past it -- a real avatar's
+;; joint-palette builder then read past the end of that accessor's data ("No item 23 in
+;; vector of length 23", found composing VRM Consortium's Seed-san as a base + a
+;; donor's hair). This reproduces the SAME shape (base skin's joints grow when a donor
+;; part contributes a joint the base doesn't have) on a minimal synthetic fixture and
+;; asserts the fix: the composed skin's joints and inverseBindMatrices must be the SAME
+;; length, and the appended joint's REAL inverse bind matrix data (not a placeholder)
+;; must survive a full compose -> export -> reparse round-trip at the right position.
+(deftest compose-grows-inverse-bind-matrices-with-donor-joints
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-2))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]
+        composed (vrm/compose-parts sources {:skeleton-base 0})
+        skin (first (get-in composed [:gltf :skins]))]
+    (testing "the donor's extra joint (HairTip) was appended to the base's joint list"
+      (is (= 4 (count (:joints skin)))
+          "base had 3 joints (Root/Hips/Head); the donor's non-humanoid HairTip joint should add exactly 1"))
+    (testing "joints and inverseBindMatrices stay the same length -- the actual bug"
+      (let [ibm-idx (:inverseBindMatrices skin)
+            ibm-accessor (get-in composed [:gltf :accessors ibm-idx])]
+        (is (= (count (:joints skin)) (:count ibm-accessor))
+            "an accessor shorter than :joints is exactly what made real-avatar loading throw \"No item N in vector of length N\"")))
+    (testing "the appended joint's REAL inverse bind matrix survives export + reparse, at the right position"
+      (let [output (vrm/export-glb composed)
+            reparsed (vrm/parse-vrm output)
+            skin2 (first (get-in reparsed [:gltf :skins]))
+            ibm-idx2 (:inverseBindMatrices skin2)
+            floats (conv/read-accessor-f32 reparsed ibm-idx2)]
+        (is (= 64 (count floats)) "4 joints * 16 floats each")
+        ;; the last joint in the (grown) joint list is the appended HairTip -- its
+        ;; matrix's translation column (last 4 floats of its 16) must be [9 8 7 1],
+        ;; the exact value from donor-doc's own inverseBindMatrices, not identity/
+        ;; zeroed/any other placeholder.
+        (is (= [9.0 8.0 7.0 1.0] (subvec floats 60 64))
+            "the donor's real IBM data for the appended joint, not a placeholder")))))
 
 ;; Document-dedup fix, isolated: two parts from the SAME doc (already covered
 ;; above) vs. parts genuinely spanning two DIFFERENT docs -- this asserts the

@@ -8,7 +8,20 @@
   `{:skeleton-base index}` (index into `sources` whose skeleton is the
   canonical armature)."
   (:require [vrm.gltf-types :as gt]
-            [vrm.vrm-types :as vt]))
+            [vrm.vrm-types :as vt]
+            [vrm.convert :as conv]))
+
+(defn- write-f32-le
+  "float -> a 4-byte little-endian vector, the write-side mirror of vrm.convert's
+  private `read-f32-le` (same #?(:clj/:cljs) split: `Float/floatToIntBits` +
+  unchecked-int byte extraction on JVM, `DataView` on cljs)."
+  [f]
+  #?(:clj (let [bits (Float/floatToIntBits (float f))]
+            [(bit-and bits 0xFF) (bit-and (bit-shift-right bits 8) 0xFF)
+             (bit-and (bit-shift-right bits 16) 0xFF) (bit-and (bit-shift-right bits 24) 0xFF)])
+     :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+             (.setFloat32 view 0 f true)
+             [(.getUint8 view 0) (.getUint8 view 1) (.getUint8 view 2) (.getUint8 view 3)])))
 
 (defn- find-parent-in-remap*
   "Walk up `doc`'s node tree from `node-idx` to find a mapped ancestor for
@@ -298,29 +311,92 @@
                   meshes mesh-remap unified-nodes]} merge-result
 
           ;; ── Phase 5: skin rebuild ──
+          ;; joint-set grows beyond the base skin's own joint list whenever a donor
+          ;; part contributes a joint the base doesn't have (e.g. hair-specific bones).
+          ;; ibm-plan tracks, PARALLEL to joint-set, where each joint's inverse bind
+          ;; matrix should be read from ({:src-idx .. :pos ..}, `pos` = that joint's
+          ;; position within ITS OWN source skin's `:joints` list, since a skin's
+          ;; inverseBindMatrices accessor is ordered by joint POSITION, not node id).
           base-skin (first (:skins base-gltf))
-          unified-skin
-          (when base-skin
-            (let [joint-set
-                  (reduce
-                   (fn [joints [src-idx src]]
-                     (if (= src-idx skeleton-base)
-                       joints
-                       (if-let [src-skin (first (:skins (:gltf (:doc src))))]
-                         (reduce (fn [joints old-joint]
-                                   (if-let [new-joint (get node-remap [src-idx old-joint])]
-                                     (if (some #{new-joint} joints) joints (conj joints new-joint))
-                                     joints))
-                                 joints (:joints src-skin))
-                         joints)))
-                   (vec (:joints base-skin))
-                   (map-indexed vector sources))
-                  ibm-acc-idx (when-let [ibm-idx (:inverseBindMatrices base-skin)]
-                                (get accessor-remap [skeleton-base ibm-idx]))]
-              {:name (:name base-skin)
-               :joints joint-set
-               :inverseBindMatrices ibm-acc-idx
-               :skeleton (when-let [s (:skeleton base-skin)] (get node-remap [skeleton-base s]))}))
+          [joint-set ibm-plan]
+          (if-not base-skin
+            [nil nil]
+            (reduce
+             (fn [[joints plan] [src-idx src]]
+               (if (= src-idx skeleton-base)
+                 [joints plan]
+                 (if-let [src-skin (first (:skins (:gltf (:doc src))))]
+                   (reduce
+                    (fn [[joints plan] [old-pos old-joint]]
+                      (if-let [new-joint (get node-remap [src-idx old-joint])]
+                        (if (some #{new-joint} joints)
+                          [joints plan]
+                          [(conj joints new-joint) (conj plan {:src-idx src-idx :pos old-pos})])
+                        [joints plan]))
+                    [joints plan]
+                    (map-indexed vector (:joints src-skin)))
+                   [joints plan])))
+             [(vec (:joints base-skin))
+              (vec (map-indexed (fn [i _] {:src-idx skeleton-base :pos i}) (:joints base-skin)))]
+             (map-indexed vector sources)))
+
+          ;; A real bug, found via net-babiniku's M6 slice-2 part-swap (composing
+          ;; Seed-san as base + a donor's hair): reusing the base's own (shorter)
+          ;; inverseBindMatrices accessor here, unchanged, left babiniku.vrm-bridge's
+          ;; joint-palette builder reading past the end of that accessor's data once it
+          ;; walked past the base's original joint count -- "No item 23 in vector of
+          ;; length 23". A skin's joints and inverseBindMatrices must be the SAME
+          ;; length; when donor joints grow the list, a fresh accessor spanning the
+          ;; full joint-set (base IBMs first, then each donor's, in append order) is
+          ;; built and appended to the merged buffer -- not a shortcut around the real
+          ;; data, an accessor with the SAME real IBM values just concatenated.
+          skin-cache (atom {})
+          base-ibm-idx (when base-skin (:inverseBindMatrices base-skin))
+          base-ibm-floats (when base-ibm-idx (conv/read-accessor-f32 base-doc base-ibm-idx))
+          ibm-floats-for
+          (fn [{:keys [src-idx pos]}]
+            (if (= src-idx skeleton-base)
+              (subvec (or base-ibm-floats []) (* pos 16) (+ (* pos 16) 16))
+              (let [src-doc (:doc (nth sources src-idx))
+                    src-skin (or (get @skin-cache src-idx)
+                                 (let [s (first (:skins (:gltf src-doc)))]
+                                   (swap! skin-cache assoc src-idx s)
+                                   s))
+                    ibm-idx (:inverseBindMatrices src-skin)]
+                (if ibm-idx
+                  (subvec (conv/read-accessor-f32 src-doc ibm-idx) (* pos 16) (+ (* pos 16) 16))
+                  ;; No IBM data at all for this donor skin: identity, same fallback
+                  ;; `skin-joint-palette` already applies when a skin lacks one.
+                  [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]))))
+          grew? (and base-skin (> (count joint-set) (count (:joints base-skin))))
+          [bin buffer-views accessors unified-skin]
+          (cond
+            (not base-skin) [bin buffer-views accessors nil]
+            (not grew?)
+            [bin buffer-views accessors
+             {:name (:name base-skin)
+              :joints joint-set
+              :inverseBindMatrices (when base-ibm-idx (get accessor-remap [skeleton-base base-ibm-idx]))
+              :skeleton (when-let [s (:skeleton base-skin)] (get node-remap [skeleton-base s]))}]
+            :else
+            (let [all-floats (vec (mapcat ibm-floats-for ibm-plan))
+                  new-bytes (vec (mapcat write-f32-le all-floats))
+                  base-offset (count bin)
+                  bin (into bin new-bytes)
+                  new-bv-idx (count buffer-views)
+                  buffer-views (conj buffer-views {:buffer 0 :byteOffset base-offset
+                                                   :byteLength (count new-bytes)})
+                  new-acc-idx (count accessors)
+                  accessors (conj accessors {:bufferView new-bv-idx
+                                             :componentType gt/component-type-float
+                                             :count (count joint-set)
+                                             :type "MAT4"
+                                             :byteOffset 0})]
+              [bin buffer-views accessors
+               {:name (:name base-skin)
+                :joints joint-set
+                :inverseBindMatrices new-acc-idx
+                :skeleton (when-let [s (:skeleton base-skin)] (get node-remap [skeleton-base s]))}]))
           unified-nodes
           (if unified-skin
             (mapv (fn [n] (if (:mesh n) (assoc n :skin 0) n)) unified-nodes)

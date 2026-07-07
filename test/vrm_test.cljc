@@ -424,16 +424,27 @@
                      {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
                      {:bufferView 2 :componentType 5121 :count 3 :type "VEC4"}
                      {:bufferView 3 :componentType 5126 :count 3 :type "VEC4"}
-                     {:bufferView 4 :componentType 5126 :count 4 :type "MAT4"}]
+                     {:bufferView 4 :componentType 5126 :count 3 :type "MAT4"}]
          :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
                        {:buffer 0 :byteOffset 36 :byteLength 12}
                        {:buffer 0 :byteOffset 48 :byteLength 12}
                        {:buffer 0 :byteOffset 60 :byteLength 48}
-                       {:buffer 0 :byteOffset 108 :byteLength 256}]
-         :buffers [{:byteLength 364}]
-         ;; joint 3 ("Unmappable") is a real skin joint but reachable via NEITHER
-         ;; the humanoid-bone path NOR the hair part's own node-indices.
-         :skins [{:joints [2 1 0 3] :inverseBindMatrices 4}]
+                       {:buffer 0 :byteOffset 108 :byteLength 192}]
+         :buffers [{:byteLength 300}]
+         ;; The skin's OWN declared joints ([2 1 0]) does NOT include node 3
+         ;; ("Unmappable") at all -- JOINTS_0 local-pos 3 below is genuinely
+         ;; out of range for this 3-element array (glTF requires every
+         ;; JOINTS_0 value to be < skin.joints.length). decompose (org-vrmc-vrm
+         ;; vrm.part, ADR-2607071610 addendum) now seeds a part's node-indices
+         ;; from every joint the part's own mesh's JOINTS_0 data genuinely
+         ;; references, so a joint that's merely a structural non-descendant
+         ;; (like the earlier version of this fixture) is legitimately
+         ;; resolved and composes correctly -- no longer a defect. What
+         ;; remains a genuine defect worth throwing on is malformed accessor
+         ;; data: a local-pos with no corresponding entry in the skin's own
+         ;; joints array at all, which no amount of decompose seeding can fix
+         ;; (there is no node to seed -- the reference is simply invalid).
+         :skins [{:joints [2 1 0] :inverseBindMatrices 4}]
          :extensions {:VRMC_vrm {:specVersion "1.0"
                                   :meta {:name "DonorAvatar3" :authors ["test"]
                                          :licenseUrl "https://vrm.dev/licenses/1.0/"
@@ -449,14 +460,15 @@
                                                (bit-shift-left (.getUint8 view 3) 24))))))
         hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
         hair-idx (mapcat glb/u32->le-bytes [0 1 2])
-        ;; slots 1-3 (Head, position 0 in [2 1 0 3]) carry the real weight; slot 4
-        ;; (Unmappable, position 3) carries `slot4-weight` -- 0.0 for the tolerant
-        ;; case, non-zero for the must-still-throw case.
+        ;; components 0-2 (local-pos 0 = Head, in [2 1 0]) carry the real weight;
+        ;; component 3 (local-pos 3 -- OUT OF RANGE for this 3-element joints
+        ;; array) carries `slot4-weight` -- 0.0 for the tolerant case, non-zero
+        ;; for the must-still-throw case.
         joints-0 (vec (mapcat (fn [_] [0 0 0 3]) (range 3)))
         w (- 1.0 slot4-weight)
         weights-0 (mapcat (fn [_] (mapcat f32->bytes [w 0.0 0.0 slot4-weight])) (range 3))
         identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
-        ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 4))
+        ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 3))
         bin (vec (concat hair-pos hair-idx joints-0 weights-0 ibm))
         json-bytes (glb/string->byte-seq (json/->json json-map))]
     (glb/write-glb json-bytes bin)))
@@ -494,6 +506,107 @@
         sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]]
     (testing "the exact real-world residual weight (0.00266, VRM1_Constraint_Twist_Sample) must not throw"
       (is (some? (vrm/compose-parts sources {:skeleton-base 0}))))))
+
+;; The exact real-world SHAPE that motivated decompose's `skin-joint-seeds` fix
+;; (org-vrmc-vrm vrm.part, ADR-2607071610 addendum, 2026-07-08): VRM1_Constraint_
+;; Twist_Sample's hair mesh has a JOINTS_0 slot with a REAL (non-negligible)
+;; weight referencing `J_Sec_Hair1_01`, a hair-sway secondary/physics bone rigged
+;; as a CHILD OF THE HEAD (a humanoid bone) -- not a child of the hair mesh's own
+;; node at all. Before the fix, decompose's node-indices for a part were a pure
+;; descendant-walk from the mesh's own node, so a skin joint hanging off a
+;; DIFFERENT branch of the tree (like this one) had no place in node-indices,
+;; and compose correctly-but-unhelpfully threw "no place in the unified
+;; skeleton" on a perfectly legitimate donor mesh. This fixture reproduces that
+;; exact topology on a minimal donor: `SecondaryBone` is a child of `Head`, the
+;; hair mesh lives on a SEPARATE, unrelated node (`HairMeshNode`, a sibling of
+;; Head under Root), and a real ~4% weight (matching the real file's ~4.1%)
+;; binds hair vertices to `SecondaryBone`.
+(defn- make-test-vrm-5-secondary-bone []
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2 4]}
+                 {:name "Hips" :translation [0 0.8 0]}
+                 {:name "Head" :translation [0 1.4 0] :children [3]}
+                 {:name "SecondaryBone" :translation [0 0.1 0.1]}
+                 {:name "HairMeshNode" :mesh 0 :skin 0 :translation [0 1.3 0]}]
+         :meshes [{:name "Hair" :primitives [{:attributes {:POSITION 0 :JOINTS_0 2 :WEIGHTS_0 3}
+                                              :indices 1 :material 0}]}]
+         :materials [{:name "hair_material" :pbrMetallicRoughness {:baseColorFactor [0.2 0.1 0.05 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.3 0.0 -0.3] :max [0.3 0.5 0.3]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5121 :count 3 :type "VEC4"}
+                     {:bufferView 3 :componentType 5126 :count 3 :type "VEC4"}
+                     {:bufferView 4 :componentType 5126 :count 4 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 12}
+                       {:buffer 0 :byteOffset 60 :byteLength 48}
+                       {:buffer 0 :byteOffset 108 :byteLength 256}]
+         :buffers [{:byteLength 364}]
+         ;; local positions: 0->Head(2) 1->Hips(1) 2->Root(0) 3->SecondaryBone(3)
+         :skins [{:joints [2 1 0 3] :inverseBindMatrices 4}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "DonorAvatar4" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
+        hair-idx (mapcat glb/u32->le-bytes [0 1 2])
+        ;; every vertex: 96% Head (local-pos 0), 4% SecondaryBone (local-pos 3) --
+        ;; matches the real file's ~4.1% J_Sec_Hair1_01 weight, well above the
+        ;; zero-weight tolerance (1e-2) -- a genuinely significant influence.
+        joints-0 (vec (mapcat (fn [_] [0 3 0 0]) (range 3)))
+        weights-0 (mapcat (fn [_] (mapcat f32->bytes [0.96 0.04 0.0 0.0])) (range 3))
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        ;; local positions 0-2 (Head/Hips/Root): identity. local position 3
+        ;; (SecondaryBone, the only one this fix ever needs to resolve): a
+        ;; distinctive translation [3 3 3], easy to assert on exactly.
+        secondary-bone-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 3.0 3.0 3.0 1.0]
+        ibm (mapcat (fn [m] (mapcat f32->bytes m))
+                    [identity-mat4 identity-mat4 identity-mat4 secondary-bone-mat4])
+        bin (vec (concat hair-pos hair-idx joints-0 weights-0 ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+(deftest decompose-seeds-secondary-bone-not-a-structural-descendant
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-5-secondary-bone))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))]
+    (testing "decompose's node-indices includes SecondaryBone even though it is NOT a descendant of the hair mesh's own node (HairMeshNode) -- it hangs off Head instead"
+      (is (some #{3} (:node-indices hair-part))
+          (str "node-indices was " (pr-str (:node-indices hair-part))
+               " -- must include node 3 (SecondaryBone), genuinely referenced by the mesh's own JOINTS_0 data"))))
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-5-secondary-bone))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]
+        composed (vrm/compose-parts sources {:skeleton-base 0})
+        skin (first (get-in composed [:gltf :skins]))]
+    (testing "composes successfully instead of throwing \"no place in the unified skeleton\" -- the exact real VRM1_Constraint_Twist_Sample failure this fix closes"
+      (is (some? composed)))
+    (testing "SecondaryBone was appended to the unified skeleton (base's 3 joints + 1)"
+      (is (= 4 (count (:joints skin)))))
+    (testing "SecondaryBone's REAL inverse bind matrix survives export + reparse, at the right position"
+      (let [output (vrm/export-glb composed)
+            reparsed (vrm/parse-vrm output)
+            skin2 (first (get-in reparsed [:gltf :skins]))
+            ibm-idx2 (:inverseBindMatrices skin2)
+            floats (conv/read-accessor-f32 reparsed ibm-idx2)]
+        (is (= 64 (count floats)) "4 joints * 16 floats each")
+        (is (= [3.0 3.0 3.0 1.0] (subvec floats 60 64))
+            "the donor's real IBM data for SecondaryBone, not a placeholder")))))
 
 ;; Document-dedup fix, isolated: two parts from the SAME doc (already covered
 ;; above) vs. parts genuinely spanning two DIFFERENT docs -- this asserts the

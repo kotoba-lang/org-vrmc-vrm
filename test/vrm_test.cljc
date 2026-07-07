@@ -209,6 +209,173 @@
         (is (= [9.0 8.0 7.0 1.0] (subvec floats 60 64))
             "the donor's real IBM data for the appended joint, not a placeholder")))))
 
+;; A third synthetic VRM: a donor whose skin lists the SAME 3 joints as the base
+;; (Root/Hips/Head -- no growth, isolating THIS bug from the inverseBindMatrices-growth
+;; one above) but in REVERSED order ([2 1 0] instead of [0 1 2]), with a real skinned
+;; Hair mesh whose every vertex is bound 100% to LOCAL position 0. Local position 0 in
+;; this donor's OWN joint order means node 2 (Head) -- a completely different bone than
+;; local position 0 would mean in the base's order (node 0, Root). Any code that copies
+;; JOINTS_0 values without remapping them would keep 0, binding hair vertices to Root
+;; instead of Head -- distinguishable, unambiguous proof either way.
+(defn- make-test-vrm-3-reversed-joints []
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2]}
+                 {:name "Hips" :translation [0 0.8 0]}
+                 {:name "Head" :mesh 0 :skin 0 :translation [0 0.4 0]}]
+         :meshes [{:name "Hair" :primitives [{:attributes {:POSITION 0 :JOINTS_0 2 :WEIGHTS_0 3}
+                                              :indices 1 :material 0}]}]
+         :materials [{:name "hair_material" :pbrMetallicRoughness {:baseColorFactor [0.2 0.1 0.05 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.3 0.0 -0.3] :max [0.3 0.5 0.3]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5121 :count 3 :type "VEC4"}
+                     {:bufferView 3 :componentType 5126 :count 3 :type "VEC4"}
+                     {:bufferView 4 :componentType 5126 :count 3 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 12}
+                       {:buffer 0 :byteOffset 60 :byteLength 48}
+                       {:buffer 0 :byteOffset 108 :byteLength 192}]
+         :buffers [{:byteLength 300}]
+         ;; REVERSED vs. the base's [0 1 2] -- the whole point of this fixture.
+         :skins [{:joints [2 1 0] :inverseBindMatrices 4}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "DonorAvatar2" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
+        hair-idx (mapcat glb/u32->le-bytes [0 1 2])
+        ;; every vertex bound 100% to LOCAL joint-array position 0.
+        joints-0 [0 0 0 0  0 0 0 0  0 0 0 0]
+        weights-0 (mapcat (fn [_] (mapcat f32->bytes [1.0 0.0 0.0 0.0])) (range 3))
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 3))
+        bin (vec (concat hair-pos hair-idx joints-0 weights-0 ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+;; Real bug regression (net-babiniku ADR-2607071600 M6 slice-2, found the same cycle as
+;; the inverseBindMatrices-growth bug above): compose's mesh remap only redirected which
+;; ACCESSOR a JOINTS_0 attribute points to, never remapped the per-vertex joint-index
+;; VALUES inside it -- so those values kept meaning "position in the DONOR's own skin
+;; joint array" even after every mesh was bound to the ONE unified skin, whose joint
+;; order can differ entirely from any individual donor's. Symptom: with the
+;; inverseBindMatrices-growth bug fixed, a composed avatar loaded without crashing but
+;; rendered visibly distorted (confirmed against real VRM Consortium avatars in a real
+;; browser). This isolates the bug on a minimal fixture designed so the WRONG answer and
+;; the RIGHT answer are unambiguously different values, not just "doesn't crash."
+(deftest compose-remaps-joints0-vertex-indices-to-unified-positions
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-3-reversed-joints))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]
+        composed (vrm/compose-parts sources {:skeleton-base 0})
+        skin (first (get-in composed [:gltf :skins]))]
+    (testing "no growth in this fixture -- isolates the JOINTS_0 bug from the IBM-growth one"
+      (is (= 3 (count (:joints skin))) "base's 3 joints (Root/Hips/Head); donor contributes nothing new"))
+    (let [hair-mesh (some #(when (= "Hair" (:name %)) %) (get-in composed [:gltf :meshes]))
+          joints-acc-idx (get-in hair-mesh [:primitives 0 :attributes :JOINTS_0])
+          values (vec (map #(int (Math/round (double %))) (conv/read-accessor-f32 composed joints-acc-idx)))]
+      (testing "raw donor value 0 (local position 0 = Head, in the donor's REVERSED order) must resolve to Head's UNIFIED position (2), not Root's (0)"
+        (is (every? #(= 2 %) values)
+            (str "expected every component to be 2 (Head's unified position); got " (pr-str values)
+                 " -- 0 would mean the raw donor-local value leaked through unremapped (binding hair to Root instead of Head)"))))))
+
+;; A 4th synthetic VRM: same as the reversed-joints donor above, plus one more node
+;; ("Unmappable" -- no humanoid bone, not a child of the Head/hair node, so genuinely
+;; unreachable from either remap path) added as a 4th joint in the skin. Real content
+;; found via net-babiniku's M6 slice-2 probe against VRM1_Constraint_Twist_Sample:
+;; JOINTS_0 slots with a ~zero WEIGHTS_0 commonly carry an arbitrary-but-valid index
+;; from a whole-file shared skin -- unrelated to the mesh, harmless to render (weight
+;; makes it inert), and MUST NOT throw. A genuinely-weighted reference to the same
+;; unmappable joint, in contrast, is a real defect and MUST still throw.
+(defn- make-test-vrm-4-unmappable-joint [slot4-weight]
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2 3]}
+                 {:name "Hips" :translation [0 0.8 0]}
+                 {:name "Head" :mesh 0 :skin 0 :translation [0 0.4 0]}
+                 {:name "Unmappable" :translation [1 0 0]}]
+         :meshes [{:name "Hair" :primitives [{:attributes {:POSITION 0 :JOINTS_0 2 :WEIGHTS_0 3}
+                                              :indices 1 :material 0}]}]
+         :materials [{:name "hair_material" :pbrMetallicRoughness {:baseColorFactor [0.2 0.1 0.05 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.3 0.0 -0.3] :max [0.3 0.5 0.3]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5121 :count 3 :type "VEC4"}
+                     {:bufferView 3 :componentType 5126 :count 3 :type "VEC4"}
+                     {:bufferView 4 :componentType 5126 :count 4 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 12}
+                       {:buffer 0 :byteOffset 60 :byteLength 48}
+                       {:buffer 0 :byteOffset 108 :byteLength 256}]
+         :buffers [{:byteLength 364}]
+         ;; joint 3 ("Unmappable") is a real skin joint but reachable via NEITHER
+         ;; the humanoid-bone path NOR the hair part's own node-indices.
+         :skins [{:joints [2 1 0 3] :inverseBindMatrices 4}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "DonorAvatar3" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
+        hair-idx (mapcat glb/u32->le-bytes [0 1 2])
+        ;; slots 1-3 (Head, position 0 in [2 1 0 3]) carry the real weight; slot 4
+        ;; (Unmappable, position 3) carries `slot4-weight` -- 0.0 for the tolerant
+        ;; case, non-zero for the must-still-throw case.
+        joints-0 (vec (mapcat (fn [_] [0 0 0 3]) (range 3)))
+        w (- 1.0 slot4-weight)
+        weights-0 (mapcat (fn [_] (mapcat f32->bytes [w 0.0 0.0 slot4-weight])) (range 3))
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 4))
+        bin (vec (concat hair-pos hair-idx joints-0 weights-0 ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+(deftest compose-tolerates-unmappable-joint-with-zero-weight
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-4-unmappable-joint 0.0))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]]
+    (testing "a zero-weight slot referencing an unmappable joint must NOT throw"
+      (is (some? (vrm/compose-parts sources {:skeleton-base 0}))
+          "real content (VRM1_Constraint_Twist_Sample's hair mesh) has exactly this shape"))))
+
+(deftest compose-still-throws-on-genuinely-weighted-unmappable-joint
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-4-unmappable-joint 0.5))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]]
+    (testing "a REAL (non-zero) weight on an unmappable joint is an actual defect -- the zero-weight tolerance above must not over-loosen this"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (vrm/compose-parts sources {:skeleton-base 0}))))))
+
 ;; Document-dedup fix, isolated: two parts from the SAME doc (already covered
 ;; above) vs. parts genuinely spanning two DIFFERENT docs -- this asserts the
 ;; dedup-by-`identical?` fix doesn't over-merge distinct documents that just

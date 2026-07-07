@@ -23,6 +23,14 @@
              (.setFloat32 view 0 f true)
              [(.getUint8 view 0) (.getUint8 view 1) (.getUint8 view 2) (.getUint8 view 3)])))
 
+(defn- write-u16-le
+  "non-negative int -> a 2-byte little-endian vector (glTF's UNSIGNED_SHORT)."
+  [v]
+  [(bit-and v 0xFF) (bit-and (bit-shift-right v 8) 0xFF)])
+
+(defn- round-to-long [v]
+  #?(:clj (long (Math/round (double v))) :cljs (js/Math.round v)))
+
 (defn- find-parent-in-remap*
   "Walk up `doc`'s node tree from `node-idx` to find a mapped ancestor for
   `src-idx` in `node-remap` (`{[src-idx old-node-idx] new-node-idx}`),
@@ -148,6 +156,37 @@
                    [(vec (:nodes base-gltf)) node-remap0]
                    (map-indexed vector sources))
 
+          ;; ── Phase 1.5: joint-set (the unified skin's final joint list) ── computed
+          ;; EARLY, right after node-remap, rather than after mesh merge -- Phase 3/4
+          ;; below needs it (as `joint-index-of`) to remap donor meshes' per-vertex
+          ;; JOINTS_0 indices into unified positions. Logic unchanged from the original
+          ;; skin-rebuild phase, just relocated so mesh merge can see its result.
+          base-skin (first (:skins base-gltf))
+          [joint-set ibm-plan]
+          (if-not base-skin
+            [nil nil]
+            (reduce
+             (fn [[joints plan] [src-idx src]]
+               (if (= src-idx skeleton-base)
+                 [joints plan]
+                 (if-let [src-skin (first (:skins (:gltf (:doc src))))]
+                   (reduce
+                    (fn [[joints plan] [old-pos old-joint]]
+                      (if-let [new-joint (get node-remap [src-idx old-joint])]
+                        (if (some #{new-joint} joints)
+                          [joints plan]
+                          [(conj joints new-joint) (conj plan {:src-idx src-idx :pos old-pos})])
+                        [joints plan]))
+                    [joints plan]
+                    (map-indexed vector (:joints src-skin)))
+                   [joints plan])))
+             [(vec (:joints base-skin))
+              (vec (map-indexed (fn [i _] {:src-idx skeleton-base :pos i}) (:joints base-skin)))]
+             (map-indexed vector sources)))
+          ;; unified node-id -> its position in joint-set, i.e. the value a remapped
+          ;; JOINTS_0 vertex index (or a skin's own :joints lookup) should resolve to.
+          joint-index-of (when joint-set (into {} (map-indexed (fn [i j] [j i]) joint-set)))
+
           ;; ── Phase 2: buffer merging ── (keyed by canonical doc index `ci`,
           ;; and SKIPPED entirely once a document's buffer/accessor data has
           ;; already been merged -- see the dedup comment above. Without the
@@ -198,6 +237,82 @@
            {:bin [] :buffer-view-remap {} :accessor-remap {} :buffer-views [] :accessors [] :seen #{}}
            (map-indexed vector sources))
           {:keys [bin buffer-view-remap accessor-remap buffer-views accessors]} buffer-merge
+
+          ;; ── JOINTS_0 per-vertex remap (a real bug, found the same way as the
+          ;; inverseBindMatrices growth bug above: net-babiniku's M6 slice-2 real
+          ;; part-swap composed without crashing but rendered visibly distorted).
+          ;; A JOINTS_0 attribute's raw values are POSITIONS INTO ITS OWN SKIN's
+          ;; :joints array, not node ids -- copying that raw data byte-for-byte
+          ;; (which buffer-merge above does, like any other accessor) is only
+          ;; correct when a mesh's skin joint ORDER is unchanged by compose. For a
+          ;; donor whose skin contributes any joint the base doesn't have, the
+          ;; unified skin's joint order differs from the donor's own, so every
+          ;; vertex from that donor bound to a shifted-position joint deforms
+          ;; against the WRONG bone. Fix: decode each JOINTS_0 accessor's real
+          ;; values via the referencing mesh's OWN skin (donor-position -> node id
+          ;; -> node-remap -> unified position via `joint-index-of`), and write a
+          ;; fresh accessor with the remapped values -- applied uniformly to every
+          ;; skinned mesh (base included: for the base's own meshes this remap is
+          ;; a no-op/identity, since joint-set starts as the base's own joints
+          ;; unchanged, so keeping the logic uniform -- rather than special-casing
+          ;; base vs donor -- avoids an asymmetric branch that could itself hide a
+          ;; bug). Known minor inefficiency: a fresh accessor is built even when
+          ;; nothing needed remapping; not worth an equality-check fast path yet.
+          joints-remap-cache (atom {})
+          extra-bin (atom [])
+          extra-buffer-views (atom [])
+          extra-accessors (atom [])
+          ;; Real content found via net-babiniku's M6 slice-2 probe against actual VRM
+          ;; Consortium avatars: VRM1_Constraint_Twist_Sample's hair mesh's JOINTS_0
+          ;; references node 14 (`J_Roll_R_UpperLeg`, a VRM1 constraint/roll bone, no
+          ;; relation to hair) -- because the WHOLE FILE shares one 83-joint skin across
+          ;; every mesh, and unused JOINTS_0 slots commonly carry an arbitrary-but-valid
+          ;; index from that shared skin rather than a sentinel. That slot's WEIGHTS_0
+          ;; is (at or near) zero, so ITS joint index has NO effect on the render --
+          ;; throwing over it would reject entirely normal real-world content. Only a
+          ;; slot with a REAL (non-zero) weight pointing at an unmappable joint is an
+          ;; actual defect worth failing loud over. (glTF WEIGHTS_0 is always >= 0, so
+          ;; a plain `<` suffices -- no cross-platform abs needed.)
+          zero-weight-eps 1e-4
+          remap-joints-accessor!
+          (fn [src-idx src-doc mesh-skin original-acc-idx weights-acc-idx]
+            (or (get @joints-remap-cache [src-idx original-acc-idx])
+                (let [raw (conv/read-accessor-f32 src-doc original-acc-idx)
+                      weights-raw (when weights-acc-idx (conv/read-accessor-f32 src-doc weights-acc-idx))
+                      ;; vertex count -- NOT (count remapped), which is the flat SCALAR
+                      ;; count (4 per vertex for VEC4); an accessor's :count is elements,
+                      ;; not components, or every downstream reader over-reads by 4x.
+                      vertex-count (get-in src-doc [:gltf :accessors original-acc-idx :count])
+                      skin-joints (:joints mesh-skin)
+                      remapped
+                      (vec (map-indexed
+                            (fn [i v]
+                              (let [local-pos (round-to-long v)
+                                    node-id (nth skin-joints local-pos nil)
+                                    unified-node (when node-id (get node-remap [src-idx node-id]))
+                                    unified-pos (when unified-node (get joint-index-of unified-node))
+                                    weight (when weights-raw (nth weights-raw i nil))]
+                                (cond
+                                  unified-pos unified-pos
+                                  (and weight (< weight zero-weight-eps)) 0
+                                  :else
+                                  (throw (ex-info "kisekae compose: a mesh references a skin joint with no place in the unified skeleton"
+                                                  {:src-idx src-idx :local-pos local-pos :node-id node-id :weight weight})))))
+                            raw))
+                      new-bytes (vec (mapcat write-u16-le remapped))
+                      base-offset (+ (count bin) (count @extra-bin))
+                      _ (swap! extra-bin into new-bytes)
+                      new-bv-idx (+ (count buffer-views) (count @extra-buffer-views))
+                      _ (swap! extra-buffer-views conj {:buffer 0 :byteOffset base-offset
+                                                        :byteLength (count new-bytes)})
+                      new-acc-idx (+ (count accessors) (count @extra-accessors))]
+                  (swap! extra-accessors conj {:bufferView new-bv-idx
+                                              :componentType gt/component-type-unsigned-short
+                                              :count vertex-count
+                                              :type "VEC4"
+                                              :byteOffset 0})
+                  (swap! joints-remap-cache assoc [src-idx original-acc-idx] new-acc-idx)
+                  new-acc-idx)))
 
           ;; ── Phase 3/4: mesh/material/texture/image merging ── (`ci` =
           ;; canonical doc index -- images/textures/materials are keyed and
@@ -268,13 +383,24 @@
                     (fn [[ms mr nodes] mi]
                       (if-let [mesh (get (:meshes src-gltf) mi)]
                         (let [new-mi (count ms)
+                              ;; Computed BEFORE remap-attr-map -- a JOINTS_0 attribute
+                              ;; needs the mesh's OWN skin (which joints its vertex
+                              ;; indices are positions into) to remap correctly.
+                              owning-node (some (fn [[ni n]] (when (= (:mesh n) mi) ni))
+                                                 (map-indexed vector (:nodes src-gltf)))
+                              mesh-skin (when (and owning-node joint-index-of)
+                                          (when-let [skin-idx (:skin (get (:nodes src-gltf) owning-node))]
+                                            (get (:skins src-gltf) skin-idx)))
                               remap-attr-map
                               (fn [attrs]
-                                (into {} (map (fn [[k v]]
-                                                (if (number? v)
-                                                  [k (get accessor-remap [ci v] v)]
-                                                  [k v])))
-                                      attrs))
+                                (let [weights-acc-idx (:WEIGHTS_0 attrs)]
+                                  (into {} (map (fn [[k v]]
+                                                  (cond
+                                                    (not (number? v)) [k v]
+                                                    (and (= k :JOINTS_0) mesh-skin)
+                                                    [k (remap-joints-accessor! src-idx src-doc mesh-skin v weights-acc-idx)]
+                                                    :else [k (get accessor-remap [ci v] v)])))
+                                        attrs)))
                               new-mesh (update mesh :primitives
                                                (fn [prims]
                                                  (mapv (fn [prim]
@@ -286,9 +412,6 @@
                                                        prims)))
                               ms (conj ms new-mesh)
                               mr (assoc mr [src-idx mi] new-mi)
-                              ;; Attach mesh to correct node.
-                              owning-node (some (fn [[ni n]] (when (= (:mesh n) mi) ni))
-                                                 (map-indexed vector (:nodes src-gltf)))
                               nodes (if (and owning-node (some #{owning-node} (:node-indices (:part src))))
                                       (if-let [new-ni (get node-remap [src-idx owning-node])]
                                         (if (< new-ni (count nodes))
@@ -309,37 +432,17 @@
            (map-indexed vector sources))
           {:keys [images samplers textures texture-remap materials material-remap
                   meshes mesh-remap unified-nodes]} merge-result
+          ;; Fold in whatever remap-joints-accessor! appended during mesh merge above
+          ;; (empty if no skinned donor mesh needed it) -- Phase 5 below computes its
+          ;; own offsets from `(count bin)` etc., so this must happen before it.
+          bin (into bin @extra-bin)
+          buffer-views (into buffer-views @extra-buffer-views)
+          accessors (into accessors @extra-accessors)
 
-          ;; ── Phase 5: skin rebuild ──
-          ;; joint-set grows beyond the base skin's own joint list whenever a donor
-          ;; part contributes a joint the base doesn't have (e.g. hair-specific bones).
-          ;; ibm-plan tracks, PARALLEL to joint-set, where each joint's inverse bind
-          ;; matrix should be read from ({:src-idx .. :pos ..}, `pos` = that joint's
-          ;; position within ITS OWN source skin's `:joints` list, since a skin's
-          ;; inverseBindMatrices accessor is ordered by joint POSITION, not node id).
-          base-skin (first (:skins base-gltf))
-          [joint-set ibm-plan]
-          (if-not base-skin
-            [nil nil]
-            (reduce
-             (fn [[joints plan] [src-idx src]]
-               (if (= src-idx skeleton-base)
-                 [joints plan]
-                 (if-let [src-skin (first (:skins (:gltf (:doc src))))]
-                   (reduce
-                    (fn [[joints plan] [old-pos old-joint]]
-                      (if-let [new-joint (get node-remap [src-idx old-joint])]
-                        (if (some #{new-joint} joints)
-                          [joints plan]
-                          [(conj joints new-joint) (conj plan {:src-idx src-idx :pos old-pos})])
-                        [joints plan]))
-                    [joints plan]
-                    (map-indexed vector (:joints src-skin)))
-                   [joints plan])))
-             [(vec (:joints base-skin))
-              (vec (map-indexed (fn [i _] {:src-idx skeleton-base :pos i}) (:joints base-skin)))]
-             (map-indexed vector sources)))
-
+          ;; ── Phase 5: skin rebuild ── joint-set/ibm-plan already computed in Phase
+          ;; 1.5 (needed early by Phase 3/4's JOINTS_0 remap); this phase just builds
+          ;; the actual inverseBindMatrices accessor from them.
+          ;;
           ;; A real bug, found via net-babiniku's M6 slice-2 part-swap (composing
           ;; Seed-san as base + a donor's hair): reusing the base's own (shorter)
           ;; inverseBindMatrices accessor here, unchanged, left babiniku.vrm-bridge's

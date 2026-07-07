@@ -376,6 +376,20 @@
       (is (thrown? #?(:clj Exception :cljs js/Error)
                    (vrm/compose-parts sources {:skeleton-base 0}))))))
 
+;; The exact real-world case (found via a direct JVM diagnostic against the actual
+;; VRM1_Constraint_Twist_Sample bytes, net-babiniku ADR-2607071610 addendum,
+;; 2026-07-07): an unmappable joint referenced with weight 0.00266 (~0.27%) -- a
+;; genuine blend-smoothing residual, neither exactly zero nor remotely significant.
+;; Confirms the tolerance threshold (1e-2) covers real evidence, not a guessed number.
+(deftest compose-tolerates-small-real-world-residual-weight
+  (let [base-doc (vrm/parse-vrm (make-test-vrm))
+        donor-doc (vrm/parse-vrm (make-test-vrm-4-unmappable-joint 0.00266))
+        body-part (some #(when (= :body (:category %)) %) (vrm/decompose base-doc))
+        hair-part (some #(when (= :hair (:category %)) %) (vrm/decompose donor-doc))
+        sources [{:part body-part :doc base-doc} {:part hair-part :doc donor-doc}]]
+    (testing "the exact real-world residual weight (0.00266, VRM1_Constraint_Twist_Sample) must not throw"
+      (is (some? (vrm/compose-parts sources {:skeleton-base 0}))))))
+
 ;; Document-dedup fix, isolated: two parts from the SAME doc (already covered
 ;; above) vs. parts genuinely spanning two DIFFERENT docs -- this asserts the
 ;; dedup-by-`identical?` fix doesn't over-merge distinct documents that just

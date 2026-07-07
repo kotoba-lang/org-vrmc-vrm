@@ -262,18 +262,20 @@
           extra-bin (atom [])
           extra-buffer-views (atom [])
           extra-accessors (atom [])
-          ;; Real content found via net-babiniku's M6 slice-2 probe against actual VRM
-          ;; Consortium avatars: VRM1_Constraint_Twist_Sample's hair mesh's JOINTS_0
-          ;; references node 14 (`J_Roll_R_UpperLeg`, a VRM1 constraint/roll bone, no
-          ;; relation to hair) -- because the WHOLE FILE shares one 83-joint skin across
-          ;; every mesh, and unused JOINTS_0 slots commonly carry an arbitrary-but-valid
-          ;; index from that shared skin rather than a sentinel. That slot's WEIGHTS_0
-          ;; is (at or near) zero, so ITS joint index has NO effect on the render --
-          ;; throwing over it would reject entirely normal real-world content. Only a
-          ;; slot with a REAL (non-zero) weight pointing at an unmappable joint is an
-          ;; actual defect worth failing loud over. (glTF WEIGHTS_0 is always >= 0, so
-          ;; a plain `<` suffices -- no cross-platform abs needed.)
-          zero-weight-eps 1e-4
+          ;; Real content found via net-babiniku's M6 slice-2 probe against VRM
+          ;; Consortium avatars (net-babiniku ADR-2607071610 addendum, 2026-07-07,
+          ;; confirmed via a direct JVM diagnostic against the actual file bytes, not a
+          ;; browser script): VRM1_Constraint_Twist_Sample's hair mesh has a JOINTS_0
+          ;; slot referencing an unmappable joint (`J_Sec_R_Bust2`, a secondary/physics
+          ;; bone unrelated to hair) with a REAL but tiny WEIGHTS_0 of 0.00266 (~0.27%)
+          ;; -- an ordinary blend-smoothing residual, not a sentinel or a meaningful
+          ;; skinning influence. Below ~1%, a joint reference is visually negligible
+          ;; regardless of what it resolves to; throwing over it would reject entirely
+          ;; normal real-world content. Only a slot with a genuinely significant weight
+          ;; pointing at an unmappable joint is an actual defect worth failing loud
+          ;; over. (glTF WEIGHTS_0 is always >= 0, so a plain `<` suffices -- no
+          ;; cross-platform abs needed.)
+          zero-weight-eps 1e-2
           remap-joints-accessor!
           (fn [src-idx src-doc mesh-skin original-acc-idx weights-acc-idx]
             (or (get @joints-remap-cache [src-idx original-acc-idx])

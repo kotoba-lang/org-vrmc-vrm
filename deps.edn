@@ -1,5 +1,5 @@
 {:paths ["src" "test"]
- :deps {io.github.kotoba-lang/glb {:local/root "../org-khronos-glb"}}
+ :deps {io.github.kotoba-lang/glb {:git/sha "87a75fd431dd2f4fb9a2b76282c5f31559963381"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}

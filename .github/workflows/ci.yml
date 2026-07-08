@@ -16,6 +16,5 @@ jobs:
       - uses: DeLaGuardo/setup-clojure@13.4
         with:
           cli: latest
-      - run: git clone --depth 1 https://github.com/kotoba-lang/org-khronos-glb ../org-khronos-glb
       - run: clojure -M:test
       - run: clojure -M:lint

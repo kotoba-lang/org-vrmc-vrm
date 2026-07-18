@@ -2,7 +2,8 @@
   "VRM part decomposition: VrmDocument -> `[VrmPart ...]`. Restored from
   `kami-vrm/src/part.rs` (kotoba-lang/kami-engine, deleted PR #82) as part of
   the clj-wgsl migration (ADR-2607010930, com-junkawasaki/root)."
-  (:require [vrm.convert :as conv]))
+  (:require [clojure.string]
+            [vrm.convert :as conv]))
 
 (defn- round-to-long [v]
   #?(:clj (long (Math/round (double v))) :cljs (js/Math.round v)))

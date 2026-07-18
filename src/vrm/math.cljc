@@ -111,6 +111,9 @@
    0.0 0.0 1.0 0.0
    0.0 0.0 0.0 1.0])
 
+(declare mat4-from-scale-rotation-translation
+         mat4-to-scale-rotation-translation)
+
 (defn mat4-mul
   "`(mat4-mul a b)` = glam's `a * b` (column-major, applies `b` first)."
   [a b]
@@ -119,6 +122,22 @@
     (vec
      (for [col (range 4) row (range 4)]
        (reduce + (for [k (range 4)] (* (ai k row) (bi col k))))))))
+
+(defn mat4-inverse-affine
+  "Inverse of an affine TRS matrix. Handles non-uniform scale by composing
+  S^-1 * R^-1 * T^-1 explicitly instead of pretending the inverse is another
+  T*R*S with independently inverted fields."
+  [m]
+  (let [[scale rotation translation] (mat4-to-scale-rotation-translation m)
+        inv-scale (mapv (fn [x]
+                          (when (< (Math/abs (double x)) 1e-12)
+                            (throw (ex-info "singular affine matrix" {:matrix m})))
+                          (/ 1.0 x))
+                        scale)
+        s (mat4-from-scale-rotation-translation inv-scale quat-identity vec3-zero)
+        r (mat4-from-scale-rotation-translation vec3-one (quat-inverse rotation) vec3-zero)
+        t (mat4-from-scale-rotation-translation vec3-one quat-identity (mapv - translation))]
+    (mat4-mul s (mat4-mul r t))))
 
 (defn quat-rotate-vec3
   "Rotate Vec3 `v` by quaternion `q` (`q * v`)."

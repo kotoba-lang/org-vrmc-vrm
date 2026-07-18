@@ -234,7 +234,17 @@
                        (reduce
                         (fn [[ar accs] [acc-idx acc-val]]
                           (let [new-acc-idx (count accs)
-                                new-bv (when-let [bv (:bufferView acc-val)] (get buffer-view-remap [ci bv]))]
+                                new-bv (when-let [bv (:bufferView acc-val)] (get buffer-view-remap [ci bv]))
+                                ;; Sparse-only morph accessors legitimately have no
+                                ;; top-level bufferView. Dropping :sparse here turns
+                                ;; them into malformed empty accessors (Rin's real
+                                ;; composed face target failed at accessor 36).
+                                sparse (when-let [s (:sparse acc-val)]
+                                         (-> s
+                                             (update-in [:indices :bufferView]
+                                                        #(get buffer-view-remap [ci %] %))
+                                             (update-in [:values :bufferView]
+                                                        #(get buffer-view-remap [ci %] %))))]
                             [(assoc ar [ci acc-idx] new-acc-idx)
                              (conj accs {:bufferView new-bv
                                          :componentType (:componentType acc-val)
@@ -243,7 +253,8 @@
                                          :byteOffset (or (:byteOffset acc-val) 0)
                                          :min (:min acc-val)
                                          :max (:max acc-val)
-                                         :normalized (boolean (:normalized acc-val))})]))
+                                         :normalized (boolean (:normalized acc-val))
+                                         :sparse sparse})]))
                         [accessor-remap accessors]
                         (map-indexed vector (:accessors src-gltf)))]
                    {:bin bin :buffer-view-remap buffer-view-remap :accessor-remap accessor-remap

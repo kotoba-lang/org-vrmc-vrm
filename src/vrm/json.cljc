@@ -9,7 +9,8 @@
   long when integral else double).
 
   Restored as part of the kami-vrm port (kotoba-lang/kami-engine, deleted PR
-  #82) per ADR-2607010930.")
+  #82) per ADR-2607010930."
+  (:require [clojure.string]))
 
 ;; ---------------------------------------------------------------------------
 ;; Parsing
